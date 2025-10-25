@@ -4,6 +4,7 @@ import 'package:postgres/postgres.dart';
 import 'package:bcrypt/bcrypt.dart';
 import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
 import 'package:jersey_premier_league_backend/models/user.dart'; // Assuming this is correct
+import 'package:http/http.dart' as http;
 
 
 // A secret key for signing JWTs. In a real production app, load this securely
@@ -309,6 +310,83 @@ class BackendAuthService {
     } catch (e) {
       print('Password Change Error: $e');
       return _jsonResponse(500, {'error': 'An unknown server error occurred'});
+    }
+  }
+
+  Future<Response> googleLoginHandler(Request request) async {
+    try {
+      final body = json.decode(await request.readAsString());
+      final idToken = body['id_token'] as String?;
+
+      if (idToken == null) {
+        return _jsonResponse(400, {'error': 'Missing Google ID token'});
+      }
+
+      // 1. Securely Verify the Google ID Token
+      final verificationUrl = Uri.parse(
+          'https://oauth2.googleapis.com/tokeninfo?id_token=$idToken');
+
+      final verificationResponse = await http.get(verificationUrl);
+
+      if (verificationResponse.statusCode != 200) {
+        // Token is invalid, expired, or malformed
+        return _jsonResponse(401, {'error': 'Invalid or expired Google ID token.'});
+      }
+
+      final googleUserPayload = json.decode(verificationResponse.body);
+      final email = googleUserPayload['email'] as String?;
+      final name = googleUserPayload['name'] as String?;
+
+      // Critical Check: Ensure email is present and verified
+      if (email == null || googleUserPayload['email_verified'] != 'true') {
+        return _jsonResponse(401, {'error': 'Google email not verified.'});
+      }
+
+      // 2. Check if user already exists in your database
+      final existingUserResult = await _dbConnection.query(
+        "SELECT id, name, email, fpl_team_id FROM users WHERE LOWER(email) = @email LIMIT 1",
+        substitutionValues: {'email': email},
+      );
+
+      BackendUser user;
+
+      if (existingUserResult.isNotEmpty) {
+        // User exists: Log them in
+        final userRow = existingUserResult.first.toColumnMap();
+        user = BackendUser.fromPostgreSQL(userRow);
+      } else {
+        // User does not exist: Register them automatically
+
+        // Google users don't need a password hash, but the column usually requires one.
+        // Use a flag or a very long dummy hash to denote external login.
+        final dummyPasswordHash = BCrypt.hashpw('google_auth_placeholder', BCrypt.gensalt());
+
+        final insertResult = await _dbConnection.query(
+          "INSERT INTO users (name, email, password_hash) VALUES (@name, @email, @hash) RETURNING id, name, email, fpl_team_id",
+          substitutionValues: {
+            'name': name ?? 'Google User',
+            'email': email,
+            'hash': dummyPasswordHash,
+          },
+        );
+        final newUserRow = insertResult.first.toColumnMap();
+        user = BackendUser.fromPostgreSQL(newUserRow);
+      }
+
+      // 3. Generate and return your app's JWT
+      final jwt = JWT({'id': user.id, 'email': user.email});
+      final token = jwt.sign(SecretKey(_jwtSecret), expiresIn: const Duration(days: 7));
+
+      final userWithToken = user.toJson()..['token'] = token;
+
+      return _jsonResponse(200, userWithToken);
+
+    } on PostgreSQLException catch (e) {
+      print('PostgreSQL Error during Google Login: $e');
+      return _jsonResponse(500, {'error': 'Database error during Google login/registration.'});
+    } catch (e) {
+      print('Google Login Error: $e');
+      return _jsonResponse(500, {'error': 'An internal server error occurred during Google Sign-In'});
     }
   }
 }
