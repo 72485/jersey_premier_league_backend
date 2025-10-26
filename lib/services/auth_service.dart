@@ -1,3 +1,5 @@
+// lib/services/auth_service.dart (Backend)
+
 import 'dart:convert';
 import 'package:shelf/shelf.dart';
 import 'package:postgres/postgres.dart';
@@ -39,7 +41,7 @@ class BackendAuthService {
     return null;
   }
 
-  // ⚡ REQUIRED FIX: Adds the missing _verifyToken helper function
+  // REQUIRED FIX: Adds the missing _verifyToken helper function
   // which is used by changePasswordHandler and updateProfileHandler.
   JWT _verifyToken(String token) {
     try {
@@ -179,10 +181,10 @@ class BackendAuthService {
       }
 
       // Verify the JWT to authenticate the user
-      final jwt = _verifyToken(token); // Uses the new _verifyToken helper
+      final jwt = _verifyToken(token);
       final payload = jwt.payload as Map<String, dynamic>;
 
-      // The ID from the JWT payload is the user's INTEGER ID (from SERIAL).
+      // The ID from the JWT payload is the user's INTEGER ID.
       final userId = payload['id'] as int;
 
       final body = json.decode(await request.readAsString());
@@ -193,9 +195,29 @@ class BackendAuthService {
         return _jsonResponse(400, {'error': 'Missing required fields: fpl_team_ID or name'});
       }
 
+      // ⚡ CRITICAL FIX: FPL Team ID Uniqueness Check
+      if (fplTeamId != null && fplTeamId.isNotEmpty) {
+        // Check if this FPL Team ID is already in use by ANY OTHER user (NOT the current user)
+        final conflictCheck = await _dbConnection.query(
+          "SELECT id FROM users WHERE fpl_team_id = @fplTeamId AND id != @userId LIMIT 1",
+          substitutionValues: {
+            'fplTeamId': fplTeamId,
+            'userId': userId,
+          },
+        );
+
+        if (conflictCheck.isNotEmpty) {
+          // Return a specific 409 Conflict status with the expected error code
+          return _jsonResponse(409, {
+            'error': 'This FPL Team ID is already in use by another user.',
+            'code': 'FPL_TEAM_ID_EXISTS', // Client side relies on this code
+          });
+        }
+      }
+      // -----------------------------------------------------
+
       // Start building the update query parts
       final List<String> setClauses = [];
-      // Use the correctly typed INTEGER userId
       final Map<String, dynamic> substitutionValues = {'userId': userId};
 
       if (fplTeamId != null) {
@@ -207,6 +229,11 @@ class BackendAuthService {
         substitutionValues['name'] = name;
       }
 
+      // If no fields are actually being set, return a success message without updating
+      if (setClauses.isEmpty) {
+        return _jsonResponse(200, {'message': 'No changes detected or fields were empty.'});
+      }
+
       // Execute the update
       final updateSql = "UPDATE users SET ${setClauses.join(', ')} WHERE id = @userId";
 
@@ -216,17 +243,30 @@ class BackendAuthService {
       );
 
       if (result == 0) {
-        return _jsonResponse(404, {'error': 'User not found'});
+        return _jsonResponse(404, {'error': 'User not found or no changes made'});
       }
 
+      // Fetch the updated user row to return the actual saved data
+      final updatedUserRow = await _dbConnection.query(
+        "SELECT id, name, email, fpl_team_id FROM users WHERE id = @userId",
+        substitutionValues: {'userId': userId},
+      );
+
+      if (updatedUserRow.isEmpty) {
+        return _jsonResponse(500, {'error': 'Internal error: Could not fetch updated user.'});
+      }
+
+      // Convert to the model
+      final user = BackendUser.fromPostgreSQL(updatedUserRow.first.toColumnMap());
+
       // Return the updated fields so the client can confirm the change
-      final Map<String, dynamic> responseBody = {'message': 'Profile updated successfully'};
-      if (fplTeamId != null) {
-        responseBody['fpl_team_ID'] = fplTeamId;
-      }
-      if (name != null) {
-        responseBody['name'] = name;
-      }
+      final Map<String, dynamic> responseBody = {
+        'message': 'Profile updated successfully',
+        'name': user.name,
+        // ⚡ FIX: The BackendUser model uses 'fplTeamID' (camelCase)
+        // The response JSON uses 'fpl_team_ID' (snake_case)
+        'fpl_team_ID': user.fplTeamID,
+      };
 
       return _jsonResponse(200, responseBody);
 
