@@ -1,35 +1,33 @@
-# Use an official Dart image as the base for building
+# --- STAGE 1: BUILD ---
+# Use the official Dart SDK image to compile the app
 FROM dart:stable AS build
 
-# Set working directory
+# Set the working directory
 WORKDIR /app
 
-# Copy pubspec and fetch dependencies
-COPY pubspec.* .
+# Copy pubspec files and resolve dependencies
+COPY pubspec.* ./
 RUN dart pub get
 
-# Copy the rest of the application source code
+# Copy source code and AOT compile it
 COPY . .
-
-# Build the server executable
+# Compile bin/server.dart to a native executable named 'server'
 RUN dart compile exe bin/server.dart -o bin/server
 
-# --- Final Stage: Minimal Runtime Image ---
-# Use a lightweight Alpine base image for the running environment
-FROM alpine:latest
-RUN apk add --no-cache openssl ca-certificates bash
+# --- STAGE 2: RUNTIME ---
+# Use the minimal 'scratch' base image for a tiny final image
+FROM scratch
 
-# Set working directory
-WORKDIR /app
+# Copy the Dart runtime libraries required for the executable from the build stage
+# This is crucial for AOT executables to run on a minimal image
+COPY --from=build /runtime/ /
 
-# Copy the pre-compiled server executable from the build stage
-COPY --from=build /app/bin/server bin/
+# Copy the compiled server executable to the final image's expected location
+COPY --from=build /app/bin/server /app/bin/server
 
-# Copy assets like the database setup script (if needed for runtime initialization)
-COPY db/db_setup.sql db/
-
-# Expose the port your application is configured to use
+# Expose the default port (8080 is a common default, but your app uses the PORT env var)
 EXPOSE 8080
 
-# Command to run your compiled server executable
+# Command to run the AOT-compiled server
+# This fixes the "exec /app/bin/server: no such file or directory" error
 CMD ["/app/bin/server"]
