@@ -1,21 +1,19 @@
+// bin/server.dart (FINAL - Concurrency Safe with package:pool)
+
 import 'dart:io';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:shelf_router/shelf_router.dart';
 import 'package:postgres/postgres.dart';
 import 'package:dotenv/dotenv.dart' as env_helper;
+import 'package:pool/pool.dart'; // 🔑 NEW: Concurrency Pool
 
-// Fix path to use the package alias
 import 'package:jersey_premier_league_backend/services/auth_service.dart';
-
-// --- Configuration Fix ---
-const String HOTSPOT_IP = '192.168.137.52';
-// ---
 
 // --- Environment Initialization ---
 final env = env_helper.DotEnv(includePlatformEnvironment: true)..load();
 
-// --- Database Initialization and Connection ---
+// --- Database Initialization and Custom Pool ---
 String _getRequiredEnv(String key) {
   final value = env[key];
   if (value == null || value.isEmpty) {
@@ -24,23 +22,31 @@ String _getRequiredEnv(String key) {
   return value;
 }
 
-Future<PostgreSQLConnection> _initializeDatabase() async {
+// 🔑 NEW: A class to manage the single PostgreSQL connection and the Pool
+class CustomDbPool {
+  final Pool requestPool;
+  final PostgreSQLConnection dbConnection;
+
+  CustomDbPool({required this.requestPool, required this.dbConnection});
+}
+
+// 🔑 FIX: Function initializes the single connection AND the Request Pool
+Future<CustomDbPool> _initializeDatabaseWithPool() async {
   try {
     final dbHost = _getRequiredEnv('DB_HOST');
-    final dbPortString = _getRequiredEnv('DB_PORT');
+    final dbPort = int.parse(_getRequiredEnv('DB_PORT'));
     final dbName = _getRequiredEnv('DB_NAME');
     final dbUser = _getRequiredEnv('DB_USER');
     final dbPassword = _getRequiredEnv('DB_PASSWORD');
 
-    final dbPort = int.parse(dbPortString);
-
+    // 1. Initialize the single, persistent connection
     final conn = PostgreSQLConnection(
       dbHost,
       dbPort,
       dbName,
       username: dbUser,
       password: dbPassword,
-      // 🔑 CRITICAL FIX: Ensure SSL is enabled for cloud databases
+      // Use useSSL: true for cloud providers like Neon/Render
       useSSL: true,
     );
 
@@ -48,25 +54,29 @@ Future<PostgreSQLConnection> _initializeDatabase() async {
     await conn.open();
     print('Successfully connected to PostgreSQL!');
 
+    // 2. Initialize schema (still necessary once)
     final schemaSql = await File('db/db_setup.sql').readAsString();
     print('Initializing database schema...');
-
+    // Ensure schema setup uses the open connection
     await conn.transaction((ctx) async {
       await ctx.execute(schemaSql);
     });
     print('Database schema initialized successfully!');
 
-    return conn;
+    // 3. 🔑 CRITICAL: Initialize the generic Pool
+    // This pool limits how many concurrent requests can use the single connection.
+    final requestPool = Pool(5);
+
+    return CustomDbPool(requestPool: requestPool, dbConnection: conn);
 
   } on FormatException {
-    print('FATAL ERROR: DB_PORT environment variable is not a valid number. Please check your .env file.');
+    print('FATAL ERROR: DB_PORT environment variable is not a valid number.');
     exit(1);
   } on PostgreSQLException catch (e) {
     print('FATAL ERROR: Failed to initialize database: $e');
-    print('If the error is "connection is insecure" or "no SSL", you must update the postgres package.');
     exit(1);
   } catch (e) {
-    print('FATAL ERROR: An unknown error occurred during database setup. Details: $e');
+    print('FATAL ERROR: An unknown error occurred: $e');
     exit(1);
   }
 }
@@ -74,33 +84,31 @@ Future<PostgreSQLConnection> _initializeDatabase() async {
 // --- Server Setup and Router ---
 
 void main() async {
-  final dbConnection = await _initializeDatabase();
+  // 🔑 CRITICAL: Get the custom pool manager object
+  final customDbPool = await _initializeDatabaseWithPool();
+  final dbConnection = customDbPool.dbConnection;
+  final requestPool = customDbPool.requestPool;
 
-  // Get port (used for local binding)
   final port = int.parse(Platform.environment['PORT'] ?? '8080');
-
-  // Fetch the publicly accessible authority (SERVER_AUTHORITY)
   final serverHost = _getRequiredEnv('SERVER_AUTHORITY');
 
-  // 🔑 START OF CRITICAL FIX BLOCK (Removed SMTP, using API Key)
-  // Fetch the SendGrid API Key (stored in the old SMTP_PASSWORD variable)
-  final sendGridApiKey = _getRequiredEnv('SMTP_PASSWORD');
-  final senderEmail = _getRequiredEnv('SENDER_EMAIL');
-
-  print('LOG: SendGrid Configuration - Host: api.sendgrid.com, User: apikey, Key Loaded.');
-
-  // Initialize the EmailService with the new, required API arguments
+  // Fetch all required SMTP environment variables and initialize EmailService
   final emailService = EmailService(
-    sendGridApiKey: sendGridApiKey, // The SendGrid API Key
-    senderEmail: senderEmail,
-    serverHost: serverHost,         // The host used to generate the verification link
+    smtpHost: _getRequiredEnv('SMTP_HOST'),
+    smtpPort: int.parse(_getRequiredEnv('SMTP_PORT')),
+    smtpUsername: _getRequiredEnv('SMTP_USERNAME'),
+    smtpPassword: _getRequiredEnv('SMTP_PASSWORD'),
+    smtpSsl: _getRequiredEnv('SMTP_SSL').toLowerCase() == 'true',
+    senderEmail: _getRequiredEnv('SENDER_EMAIL'),
   );
-  // 🔑 END OF CRITICAL FIX BLOCK
 
-  // Pass the initialized services to the AuthService
-  final authService = BackendAuthService(dbConnection, emailService, serverHost);
+  // 🔑 CRITICAL: Pass the single connection AND the Pool object
+  final authService = BackendAuthService(dbConnection, requestPool, emailService, serverHost);
 
   final appRouter = Router();
+
+  // Keep-Alive Route
+  appRouter.get('/api/status', (Request request) => Response.ok('OK'));
 
   // Public Routes (No authentication required)
   appRouter.post('/api/register', authService.registerHandler);
@@ -112,6 +120,7 @@ void main() async {
   appRouter.post('/api/password/change', authService.changePasswordHandler);
   appRouter.post('/api/auth/google', authService.googleLoginHandler);
 
+
   // CORS Middleware setup
   final handler = const Pipeline()
       .addMiddleware(_corsHeaders())
@@ -119,11 +128,8 @@ void main() async {
       .addHandler(appRouter);
 
   // Start the server
-  // Note: Serving on InternetAddress.anyIPv4 allows all network access (local and public).
   final server = await io.serve(handler, InternetAddress.anyIPv4, port);
-
   print('Server listening on http://${server.address.host}:${server.port}');
-  print('Verification links will use: http://$serverHost/api/verify');
 }
 
 // Middleware to handle CORS (Cross-Origin Resource Sharing)

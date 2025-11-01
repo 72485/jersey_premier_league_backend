@@ -10,8 +10,11 @@ dependencies:
   dart_jsonwebtoken: ^3.3.1
   shelf: ^1.4.1
   shelf_router: ^1.1.4
-  # 🔑 CRITICAL FIX: Update to version 3.0.0 or higher
+  # 🔑 FIX: Revert to the stable version that works for you
   postgres: ^2.5.0
+
+  # 🔑 NEW: Add the generic pool library for managing concurrency
+  pool: ^1.5.2
   bcrypt: ^1.1.3
   dotenv: ^4.0.0
   http: ^1.1.0

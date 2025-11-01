@@ -1,4 +1,4 @@
-// lib/services/auth_service.dart (Backend)
+// lib/services/auth_service.dart (FINAL - Concurrency Safe with package:pool)
 
 import 'dart:convert';
 import 'package:shelf/shelf.dart';
@@ -11,86 +11,70 @@ import 'dart:math';
 
 import 'package:mailer/mailer.dart';
 import 'package:mailer/smtp_server.dart';
+import 'package:pool/pool.dart'; // 🔑 NEW: Import the Pool library
+
 
 // A secret key for signing JWTs.
 const String _jwtSecret = 'supersecretjwtkeyforjplapp';
 
-
-// 🔑 MODIFIED CLASS: Email Service for SendGrid HTTP API
+// ... (EmailService class remains unchanged) ...
 class EmailService {
-  final String _sendGridApiKey;
+  final SmtpServer _smtpServer;
   final String _senderEmail;
-  final String _serverHost; // Keep for generating the verification link
 
   EmailService({
-    // Simplified constructor: Only need the API Key (Password), Sender Email, and Host
-    required String sendGridApiKey,
+    required String smtpHost,
+    required int smtpPort,
+    required String smtpUsername,
+    required String smtpPassword,
+    required bool smtpSsl,
     required String senderEmail,
-    required String serverHost,
-    // You can remove the old smtpHost/Port/Username/Password/Ssl fields
   })  : _senderEmail = senderEmail,
-        _sendGridApiKey = sendGridApiKey,
-        _serverHost = serverHost;
+        _smtpServer = SmtpServer(
+          smtpHost,
+          port: smtpPort,
+          username: smtpUsername,
+          password: smtpPassword,
+          ssl: smtpSsl,
+        );
 
-
+  // ... (sendVerificationEmail function remains unchanged) ...
   Future<void> sendVerificationEmail({
     required String recipientEmail,
     required String verificationToken,
-    required String serverHost, // Can use this or _serverHost
+    required String serverHost,
   }) async {
     final verificationLink = 'http://$serverHost/api/verify?token=$verificationToken';
 
-    print('LOG: Starting SendGrid API email send to $recipientEmail. Link: $verificationLink');
+    print('LOG: Starting email send to $recipientEmail. Link: $verificationLink');
 
-    final url = Uri.parse('https://api.sendgrid.com/v3/mail/send');
-
-    // SendGrid API payload structure
-    final emailBody = json.encode({
-      "personalizations": [
-        {
-          "to": [{"email": recipientEmail}],
-          "subject": "Jersey Premier League - Account Verification"
-        }
-      ],
-      "from": {"email": _senderEmail, "name": "JPL Support"},
-      "content": [
-        {
-          "type": "text/html",
-          "value": '''
-            <p>Thank you for registering for the Jersey Premier League!</p>
-            <p>Please click the link below to verify your email address:</p>
-            <p><a href="$verificationLink">$verificationLink</a></p>
-            <p>If you did not sign up for this account, please ignore this email.</p>
-            <p>Best regards,<br>The JPL Team</p>
-          '''
-        }
-      ]
-    });
+    final message = Message()
+      ..from = Address(_senderEmail, 'JPL Support')
+      ..recipients.add(recipientEmail)
+      ..subject = 'Jersey Premier League - Account Verification'
+      ..html = '''
+        <p>Thank you for registering for the Jersey Premier League!</p>
+        <p>Please click the link below to verify your email address:</p>
+        <p><a href="$verificationLink">$verificationLink</a></p>
+        <p>If you did not sign up for this account, please ignore this email.</p>
+        <p>Best regards,<br>The JPL Team</p>
+      ''';
 
     try {
-      final response = await http.post(
-        url,
-        headers: {
-          // Authorization uses the "Bearer" token scheme
-          'Authorization': 'Bearer $_sendGridApiKey',
-          'Content-Type': 'application/json',
-        },
-        body: emailBody,
-      );
+      await send(message, _smtpServer);
+      print('LOG: Message sent successfully to $recipientEmail!');
 
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        print('LOG: SendGrid API request successful for $recipientEmail! Status: ${response.statusCode}');
-      } else {
-        // Handle API error messages from SendGrid
-        print('!!! CRITICAL ERROR: SendGrid API failed. Status: ${response.statusCode}');
-        print('Response Body: ${response.body}');
-        throw Exception('Failed to send verification email via API. Status: ${response.statusCode}. Details: ${response.body}');
+    } on MailerException catch (e) {
+      print('!!! CRITICAL ERROR: Message not sent. MailerException details:');
+      for (var p in e.problems) {
+        print('Problem Code: ${p.code}, Message: ${p.msg}');
       }
+      throw Exception('Failed to send verification email.');
 
-    } catch (e) {
-      // Catch any SocketException or unexpected http error
-      print('!!! CRITICAL ERROR: Unexpected network error sending email via API: $e');
-      throw Exception('Failed to send verification email due to an unexpected API error: $e');
+    } catch (e, stackTrace) {
+      print('!!! CRITICAL ERROR: Unexpected error sending email: $e');
+      print('Stack Trace: $stackTrace');
+      throw Exception('Failed to send verification email due to an unexpected error: $e');
     }
   }
 }
@@ -98,14 +82,17 @@ class EmailService {
 
 /// Service class responsible for handling all authentication-related logic
 class BackendAuthService {
+  // 🔑 FIX: Store the single connection object
   final PostgreSQLConnection _dbConnection;
+  // 🔑 FIX: Store the concurrency pool object
+  final Pool _requestPool;
   final EmailService _emailService;
   final String _serverHost;
 
-  BackendAuthService(this._dbConnection, this._emailService, this._serverHost);
+  // 🔑 FIX: Update constructor to accept both objects
+  BackendAuthService(this._dbConnection, this._requestPool, this._emailService, this._serverHost);
 
-  // ... (All helper functions and API handlers follow below) ...
-
+  // --- Helper Functions ---
   String _generateVerificationToken() {
     const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     final random = Random.secure();
@@ -173,29 +160,37 @@ class BackendAuthService {
       }
 
       final email = emailInput.toLowerCase();
-
-      final existingUser = await _dbConnection.query(
-        "SELECT id FROM users WHERE LOWER(email) = @email LIMIT 1",
-        substitutionValues: {'email': email},
-      );
-
-      if (existingUser.isNotEmpty) {
-        print('LOG: Registration failed - Email already exists: $email');
-        return _jsonResponse(409, {'error': 'User with this email already exists'});
-      }
-
       final hashedPassword = BCrypt.hashpw(password, BCrypt.gensalt());
       final verificationToken = _generateVerificationToken();
 
-      final result = await _dbConnection.query(
-        "INSERT INTO users (name, email, password_hash, is_email_verified, verification_token) VALUES (@name, @email, @hash, FALSE, @token) RETURNING id, name, email, fpl_team_id, is_email_verified",
-        substitutionValues: {
-          'name': name,
-          'email': email,
-          'hash': hashedPassword,
-          'token': verificationToken,
-        },
-      );
+      // 🔑 CRITICAL FIX: Wrap the entire DB operation in the request pool
+      final result = await _requestPool.withResource(() async {
+
+        // Use the persistent connection object inside the pool block
+        return _dbConnection.transaction((ctx) async {
+
+          // 1. Check for existing user
+          final existingUser = await ctx.query(
+            "SELECT id FROM users WHERE LOWER(email) = @email LIMIT 1",
+            substitutionValues: {'email': email},
+          );
+
+          if (existingUser.isNotEmpty) {
+            throw Exception('User with this email already exists');
+          }
+
+          // 2. Insert new user
+          return ctx.query(
+            "INSERT INTO users (name, email, password_hash, is_email_verified, verification_token) VALUES (@name, @email, @hash, FALSE, @token) RETURNING id, name, email, fpl_team_id, is_email_verified",
+            substitutionValues: {
+              'name': name,
+              'email': email,
+              'hash': hashedPassword,
+              'token': verificationToken,
+            },
+          );
+        });
+      });
       print('LOG: User successfully inserted into database: $email');
 
       final newUserRow = result.first.toColumnMap();
@@ -214,10 +209,15 @@ class BackendAuthService {
       }
 
       return _jsonResponse(201, user.toJson()..['message'] = 'User registered. Please check your email for verification.');
+
     } on PostgreSQLException catch (e) {
       print('!!! PostgreSQL Error during Registration: $e');
       return _jsonResponse(500, {'error': 'Database error: Could not register user.'});
     } catch (e) {
+      // Handle the 'Email already exists' exception thrown inside the pool run block
+      if (e.toString().contains('User with this email already exists')) {
+        return _jsonResponse(409, {'error': 'User with this email already exists'});
+      }
       print('!!! Registration Error (Unhandled): $e');
       return _jsonResponse(500, {'error': 'An internal server error occurred'});
     }
@@ -236,10 +236,13 @@ class BackendAuthService {
 
       final email = emailInput.toLowerCase();
 
-      final result = await _dbConnection.query(
-        "SELECT id, name, email, password_hash, fpl_team_id, is_email_verified FROM users WHERE LOWER(email) = @email LIMIT 1",
-        substitutionValues: {'email': email},
-      );
+      // 🔑 CRITICAL FIX: Wrap the query in the request pool
+      final result = await _requestPool.withResource(() async {
+        return _dbConnection.query(
+          "SELECT id, name, email, password_hash, fpl_team_id, is_email_verified FROM users WHERE LOWER(email) = @email LIMIT 1",
+          substitutionValues: {'email': email},
+        );
+      });
 
       if (result.isEmpty) {
         return _jsonResponse(401, {'error': 'Invalid email or password'});
@@ -279,10 +282,13 @@ class BackendAuthService {
         return Response.badRequest(body: 'Missing verification token');
       }
 
-      final resultCount = await _dbConnection.execute(
-        "UPDATE users SET is_email_verified = TRUE, verification_token = NULL WHERE verification_token = @token AND is_email_verified = FALSE",
-        substitutionValues: {'token': token},
-      );
+      // 🔑 CRITICAL FIX: Wrap the execute in the request pool
+      final resultCount = await _requestPool.withResource(() async {
+        return _dbConnection.execute(
+          "UPDATE users SET is_email_verified = TRUE, verification_token = NULL WHERE verification_token = @token AND is_email_verified = FALSE",
+          substitutionValues: {'token': token},
+        );
+      });
 
       if (resultCount == 0) {
         return Response.notFound('<h1>Verification Failed</h1><p>Invalid, expired, or already-used verification link.</p>', headers: {'Content-Type': 'text/html'});
@@ -319,31 +325,38 @@ class BackendAuthService {
       final updates = <String, dynamic>{};
       final updateClauses = <String>[];
 
-      if (newName != null) {
-        updateClauses.add('name = @name');
-        updates['name'] = newName;
-      }
+      // Use a single pool resource block for all DB operations in this handler
+      final result = await _requestPool.withResource(() async {
 
-      if (newFplTeamID != null) {
-        final existingFplId = await _dbConnection.query(
-          "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
-          substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
-        );
+        if (newFplTeamID != null) {
+          // Check for existing FPL ID
+          final existingFplId = await _dbConnection.query(
+            "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
+            substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
+          );
 
-        if (existingFplId.isNotEmpty) {
-          return _jsonResponse(409, {'error': 'FPL_TEAM_ID_EXISTS'});
+          if (existingFplId.isNotEmpty) {
+            throw Exception('FPL_TEAM_ID_EXISTS');
+          }
+
+          updateClauses.add('fpl_team_id = @fplId');
+          updates['fplId'] = newFplTeamID;
         }
 
-        updateClauses.add('fpl_team_id = @fplId');
-        updates['fplId'] = newFplTeamID;
-      }
+        if (newName != null) {
+          updateClauses.add('name = @name');
+          updates['name'] = newName;
+        }
 
-      updates['userId'] = userID;
+        updates['userId'] = userID;
 
-      final result = await _dbConnection.query(
-        "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
-        substitutionValues: updates,
-      );
+        // Perform the update query
+        return _dbConnection.query(
+          "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
+          substitutionValues: updates,
+        );
+      });
+
 
       if (result.isEmpty) {
         return _jsonResponse(404, {'error': 'User not found'});
@@ -358,6 +371,10 @@ class BackendAuthService {
       print('PostgreSQL Error during Profile Update: $e');
       return _jsonResponse(500, {'error': 'Database error during profile update.'});
     } catch (e) {
+      // Handle the custom exception thrown inside the pool block
+      if (e.toString().contains('FPL_TEAM_ID_EXISTS')) {
+        return _jsonResponse(409, {'error': 'FPL Team ID is already in use by another account.'});
+      }
       print('Profile Update Error: $e');
       return _jsonResponse(500, {'error': 'Internal server error'});
     }
@@ -381,27 +398,36 @@ class BackendAuthService {
         return _jsonResponse(400, {'error': 'Missing current or new password.'});
       }
 
-      final result = await _dbConnection.query(
-        "SELECT password_hash FROM users WHERE id = @userId LIMIT 1",
-        substitutionValues: {'userId': userID},
-      );
+      // 🔑 CRITICAL FIX: Wrap all database operations in the request pool
+      final operationResult = await _requestPool.withResource(() async {
 
-      if (result.isEmpty) {
-        return _jsonResponse(404, {'error': 'User not found'});
-      }
+        // 1. Fetch the password hash
+        final result = await _dbConnection.query(
+          "SELECT password_hash FROM users WHERE id = @userId LIMIT 1",
+          substitutionValues: {'userId': userID},
+        );
 
-      final storedHash = result.first.toColumnMap()['password_hash'] as String;
+        if (result.isEmpty) {
+          throw Exception('User not found');
+        }
 
-      if (!BCrypt.checkpw(currentPassword, storedHash)) {
-        return _jsonResponse(401, {'error': 'Incorrect current password'});
-      }
+        final storedHash = result.first.toColumnMap()['password_hash'] as String;
 
-      final newHashedPassword = BCrypt.hashpw(newPassword, BCrypt.gensalt());
+        if (!BCrypt.checkpw(currentPassword, storedHash)) {
+          throw Exception('Incorrect current password');
+        }
 
-      await _dbConnection.execute(
-        "UPDATE users SET password_hash = @newHash WHERE id = @userId",
-        substitutionValues: {'newHash': newHashedPassword, 'userId': userID},
-      );
+        final newHashedPassword = BCrypt.hashpw(newPassword, BCrypt.gensalt());
+
+        // 2. Execute the update
+        await _dbConnection.execute(
+          "UPDATE users SET password_hash = @newHash WHERE id = @userId",
+          substitutionValues: {'newHash': newHashedPassword, 'userId': userID},
+        );
+
+        return true; // Return a success indicator
+
+      });
 
       return _jsonResponse(200, {'message': 'Password updated successfully'});
 
@@ -409,6 +435,12 @@ class BackendAuthService {
       print('PostgreSQL Error during Password Change: $e');
       return _jsonResponse(500, {'error': 'Database error during password change.'});
     } catch (e) {
+      if (e.toString().contains('User not found')) {
+        return _jsonResponse(404, {'error': 'User not found'});
+      }
+      if (e.toString().contains('Incorrect current password')) {
+        return _jsonResponse(401, {'error': 'Incorrect current password'});
+      }
       print('Password Change Error: $e');
       return _jsonResponse(500, {'error': 'Internal server error'});
     }
@@ -417,6 +449,7 @@ class BackendAuthService {
   /// Handles POST /api/auth/google
   Future<Response> googleLoginHandler(Request request) async {
     try {
+      // ... (Google token verification code remains unchanged) ...
       final body = json.decode(await request.readAsString());
       final idToken = body['id_token'] as String?;
 
@@ -442,34 +475,37 @@ class BackendAuthService {
         return _jsonResponse(401, {'error': 'Google email not verified.'});
       }
 
-      // Check for existing user
-      final existingUserResult = await _dbConnection.query(
-        "SELECT id, name, email, fpl_team_id, is_email_verified FROM users WHERE LOWER(email) = @email LIMIT 1",
-        substitutionValues: {'email': email},
-      );
 
-      BackendUser user;
-
-      if (existingUserResult.isNotEmpty) {
-        // User exists
-        final userRow = existingUserResult.first.toColumnMap();
-        user = BackendUser.fromPostgreSQL(userRow);
-      } else {
-        // User does not exist: Register them automatically
-        final dummyPasswordHash = BCrypt.hashpw('google_auth_placeholder', BCrypt.gensalt());
-
-        // Insert new user, marking them as verified by default since Google confirmed it
-        final insertResult = await _dbConnection.query(
-          "INSERT INTO users (name, email, password_hash, is_email_verified) VALUES (@name, @email, @hash, TRUE) RETURNING id, name, email, fpl_team_id, is_email_verified",
-          substitutionValues: {
-            'name': name ?? 'Google User',
-            'email': email,
-            'hash': dummyPasswordHash,
-          },
+      // 🔑 CRITICAL FIX: Wrap all database operations in the request pool
+      final user = await _requestPool.withResource(() async {
+        // Check for existing user
+        final existingUserResult = await _dbConnection.query(
+          "SELECT id, name, email, fpl_team_id, is_email_verified FROM users WHERE LOWER(email) = @email LIMIT 1",
+          substitutionValues: {'email': email},
         );
-        final newUserRow = insertResult.first.toColumnMap();
-        user = BackendUser.fromPostgreSQL(newUserRow);
-      }
+
+        if (existingUserResult.isNotEmpty) {
+          // User exists
+          final userRow = existingUserResult.first.toColumnMap();
+          return BackendUser.fromPostgreSQL(userRow);
+        } else {
+          // User does not exist: Register them automatically
+          final dummyPasswordHash = BCrypt.hashpw('google_auth_placeholder', BCrypt.gensalt());
+
+          // Insert new user, marking them as verified by default since Google confirmed it
+          final insertResult = await _dbConnection.query(
+            "INSERT INTO users (name, email, password_hash, is_email_verified) VALUES (@name, @email, @hash, TRUE) RETURNING id, name, email, fpl_team_id, is_email_verified",
+            substitutionValues: {
+              'name': name ?? 'Google User',
+              'email': email,
+              'hash': dummyPasswordHash,
+            },
+          );
+          final newUserRow = insertResult.first.toColumnMap();
+          return BackendUser.fromPostgreSQL(newUserRow);
+        }
+      });
+
 
       // Generate JWT, including the verification status
       final jwt = JWT({'id': user.id, 'email': user.email, 'verified': user.isEmailVerified});
