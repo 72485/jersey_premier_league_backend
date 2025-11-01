@@ -16,70 +16,81 @@ import 'package:mailer/smtp_server.dart';
 const String _jwtSecret = 'supersecretjwtkeyforjplapp';
 
 
-// 🔑 MODIFIED CLASS: Email Service for sending actual emails
+// 🔑 MODIFIED CLASS: Email Service for SendGrid HTTP API
 class EmailService {
-  final SmtpServer _smtpServer;
-  final String _senderEmail; // NOW STORES the SENDER_EMAIL from .env
+  final String _sendGridApiKey;
+  final String _senderEmail;
+  final String _serverHost; // Keep for generating the verification link
 
   EmailService({
-    required String smtpHost,
-    required int smtpPort,
-    required String smtpUsername, // Used for authentication (e.g., Mailtrap token)
-    required String smtpPassword,
-    required bool smtpSsl,
-    required String senderEmail, // The email address to display in the 'From' field
-  })  : _senderEmail = senderEmail, // Assign the proper sender email
-        _smtpServer = SmtpServer(
-          smtpHost,
-          port: smtpPort,
-          username: smtpUsername,
-          password: smtpPassword,
-          ssl: smtpSsl,
-
-        );
+    // Simplified constructor: Only need the API Key (Password), Sender Email, and Host
+    required String sendGridApiKey,
+    required String senderEmail,
+    required String serverHost,
+    // You can remove the old smtpHost/Port/Username/Password/Ssl fields
+  })  : _senderEmail = senderEmail,
+        _sendGridApiKey = sendGridApiKey,
+        _serverHost = serverHost;
 
 
   Future<void> sendVerificationEmail({
     required String recipientEmail,
     required String verificationToken,
-    required String serverHost, // e.g., '192.168.137.52:8080'
+    required String serverHost, // Can use this or _serverHost
   }) async {
     final verificationLink = 'http://$serverHost/api/verify?token=$verificationToken';
 
-    print('LOG: Starting email send to $recipientEmail. Link: $verificationLink');
+    print('LOG: Starting SendGrid API email send to $recipientEmail. Link: $verificationLink');
 
-    final message = Message()
-    // FIX: Uses _senderEmail (e.g., jpl.support@example.com) for the 'From' address.
-      ..from = Address(_senderEmail, 'JPL Support')
-      ..recipients.add(recipientEmail)
-      ..subject = 'Jersey Premier League - Account Verification'
-      ..html = '''
-        <p>Thank you for registering for the Jersey Premier League!</p>
-        <p>Please click the link below to verify your email address:</p>
-        <p><a href="$verificationLink">$verificationLink</a></p>
-        <p>If you did not sign up for this account, please ignore this email.</p>
-        <p>Best regards,<br>The JPL Team</p>
-      ''';
+    final url = Uri.parse('https://api.sendgrid.com/v3/mail/send');
 
+    // SendGrid API payload structure
+    final emailBody = json.encode({
+      "personalizations": [
+        {
+          "to": [{"email": recipientEmail}],
+          "subject": "Jersey Premier League - Account Verification"
+        }
+      ],
+      "from": {"email": _senderEmail, "name": "JPL Support"},
+      "content": [
+        {
+          "type": "text/html",
+          "value": '''
+            <p>Thank you for registering for the Jersey Premier League!</p>
+            <p>Please click the link below to verify your email address:</p>
+            <p><a href="$verificationLink">$verificationLink</a></p>
+            <p>If you did not sign up for this account, please ignore this email.</p>
+            <p>Best regards,<br>The JPL Team</p>
+          '''
+        }
+      ]
+    });
 
     try {
-      await send(
-          message, _smtpServer,
-          timeout: Duration(seconds: 20));
-      print('LOG: Message sent successfully to $recipientEmail!');
+      final response = await http.post(
+        url,
+        headers: {
+          // Authorization uses the "Bearer" token scheme
+          'Authorization': 'Bearer $_sendGridApiKey',
+          'Content-Type': 'application/json',
+        },
+        body: emailBody,
+      );
 
-    } on MailerException catch (e) {
-      print('!!! CRITICAL ERROR: Message not sent. MailerException details:');
-      // 🔑 CRITICAL FIX: Print every problem code and message for detailed debugging
-      for (var p in e.problems) {
-        print('Problem Code: ${p.code}, Message: ${p.msg}');
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        print('LOG: SendGrid API request successful for $recipientEmail! Status: ${response.statusCode}');
+      } else {
+        // Handle API error messages from SendGrid
+        print('!!! CRITICAL ERROR: SendGrid API failed. Status: ${response.statusCode}');
+        print('Response Body: ${response.body}');
+        throw Exception('Failed to send verification email via API. Status: ${response.statusCode}. Details: ${response.body}');
       }
-      throw Exception('Failed to send verification email.');
 
-    } catch (e, stackTrace) {
-      print('!!! CRITICAL ERROR: Unexpected error sending email: $e');
-      print('Stack Trace: $stackTrace');
-      throw Exception('Failed to send verification email due to an unexpected error: $e');
+    } catch (e) {
+      // Catch any SocketException or unexpected http error
+      print('!!! CRITICAL ERROR: Unexpected network error sending email via API: $e');
+      throw Exception('Failed to send verification email due to an unexpected API error: $e');
     }
   }
 }
