@@ -4,13 +4,14 @@ description: A custom REST API for the JPL Flutter app using Dart and PostgreSQL
 version: 1.0.0
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: ">=2.12.0 <3.0.0"
 
 dependencies:
-  dart_jsonwebtoken: ^2.7.1
+  dart_jsonwebtoken: ^3.3.1
   shelf: ^1.4.1
   shelf_router: ^1.1.4
-  postgres: ^2.5.0 # <--- MUST BE PRESENT!
+  # 🔑 CRITICAL FIX: Update to version 3.0.0 or higher
+  postgres: ^2.5.0
   bcrypt: ^1.1.3
   dotenv: ^4.0.0
   http: ^1.1.0

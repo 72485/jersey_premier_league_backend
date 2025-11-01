@@ -35,6 +35,7 @@ class EmailService {
           username: smtpUsername,
           password: smtpPassword,
           ssl: smtpSsl,
+
         );
 
 
@@ -60,8 +61,11 @@ class EmailService {
         <p>Best regards,<br>The JPL Team</p>
       ''';
 
+
     try {
-      await send(message, _smtpServer);
+      await send(
+          message, _smtpServer,
+          timeout: Duration(seconds: 120));
       print('LOG: Message sent successfully to $recipientEmail!');
 
     } on MailerException catch (e) {
