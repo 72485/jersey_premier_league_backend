@@ -305,6 +305,74 @@ class BackendAuthService {
     }
   }
 
+  // /// HANDLER: Handles POST /api/profile/fpl-team-id
+// Assumes this function is added alongside your other handlers
+
+  Future<Response> updateFplTeamIdHandler(Request request) async {
+    final payload = await _validateToken(request);
+    if (payload == null) {
+      return _jsonResponse(401, {'error': 'Unauthorized: Invalid or missing token'});
+    }
+
+    try {
+      final userID = payload['id'] as int;
+      final body = json.decode(await request.readAsString());
+
+      // 🔑 NOTE: Using 'fpl_team_id' (lowercase) for standard JSON convention
+      final newFplTeamID = body['fpl_team_id'] as String?;
+
+      if (newFplTeamID == null) {
+        // The backend needs to know if the user wants to set it to null or if the field is missing.
+        // Since this is a setup page, we can assume the field must be present (or null if they clear it).
+        // If it's null, we allow it (to handle clearing the field), but if it's explicitly set to an empty string, we should fail fast.
+        // For setup, let's assume if it's null, we require it to be set.
+        return _jsonResponse(400, {'error': 'FPL Team ID is required.'});
+      }
+
+      final result = await _requestPool.withResource(() async {
+
+        // Check for existing FPL ID only if a value is provided (not null)
+        if (newFplTeamID != null && newFplTeamID.isNotEmpty) {
+          final existingFplId = await _dbConnection.query(
+            "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
+            substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
+          );
+
+          if (existingFplId.isNotEmpty) {
+            throw Exception('FPL_TEAM_ID_EXISTS');
+          }
+        }
+
+        // Perform the update query. The value can be a string or NULL (from Dart's null).
+        // The user must explicitly send NULL to clear the field.
+        return _dbConnection.query(
+          "UPDATE users SET fpl_team_id = @fplId WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
+          substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
+        );
+      });
+
+      if (result.isEmpty) {
+        return _jsonResponse(404, {'error': 'User not found'});
+      }
+
+      final updatedUserRow = result.first.toColumnMap();
+      final user = BackendUser.fromPostgreSQL(updatedUserRow);
+
+      return _jsonResponse(200, user.toJson()..['message'] = 'FPL Team ID updated successfully');
+
+    } on PostgreSQLException catch (e) {
+      print('PostgreSQL Error during FPL ID Update: $e');
+      return _jsonResponse(500, {'error': 'Database error during FPL ID update.'});
+    } catch (e) {
+      // Handle the custom exception thrown inside the pool block
+      if (e.toString().contains('FPL_TEAM_ID_EXISTS')) {
+        return _jsonResponse(409, {'error': 'FPL Team ID is already in use by another account.'});
+      }
+      print('FPL ID Update Error: $e');
+      return _jsonResponse(500, {'error': 'Internal server error'});
+    }
+  }
+
   /// HANDLER: Handles POST /api/profile/update
   Future<Response> updateProfileHandler(Request request) async {
     final payload = await _validateToken(request);
