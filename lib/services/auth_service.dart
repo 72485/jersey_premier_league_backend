@@ -31,10 +31,10 @@ class EmailService {
   })  : _senderEmail = senderEmail, // Assign the proper sender email
         _smtpServer = SmtpServer(
           smtpHost,
-          port: 465,
+          port: smtpPort,
           username: smtpUsername,
           password: smtpPassword,
-          ssl: true,
+          ssl: smtpSsl,
 
         );
 
