@@ -65,7 +65,7 @@ class EmailService {
     try {
       await send(
           message, _smtpServer,
-          timeout: Duration(seconds: 120));
+          timeout: Duration(seconds: 20));
       print('LOG: Message sent successfully to $recipientEmail!');
 
     } on MailerException catch (e) {
