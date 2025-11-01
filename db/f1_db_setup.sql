@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS F1_LEAGUE (
     setup_timestamp TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
+
 -- =================================================================
 -- F1_CONSTRUCTORS: Defines the 10 two-person teams (e.g., Red Bull)
 -- =================================================================
