@@ -1,20 +1,15 @@
-
-// bin/server.dart
-
 import 'dart:io';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:shelf_router/shelf_router.dart';
-import 'package:postgres/postgres.dart'; // Ensure this import brings in SslMode
+import 'package:postgres/postgres.dart';
 import 'package:dotenv/dotenv.dart' as env_helper;
 
 // Fix path to use the package alias
 import 'package:jersey_premier_league_backend/services/auth_service.dart';
 
 // --- Configuration Fix ---
-// This HOTSPOT_IP is now only used for reference, not the link construction.
 const String HOTSPOT_IP = '192.168.137.52';
-// 🔑 REMOVED: const String LOCAL_IP = 'localhost';
 // ---
 
 // --- Environment Initialization ---
@@ -45,9 +40,8 @@ Future<PostgreSQLConnection> _initializeDatabase() async {
       dbName,
       username: dbUser,
       password: dbPassword,
-      // 🔑 CRITICAL FIX: SslMode.require forces the secure connection Neon needs.
+      // 🔑 CRITICAL FIX: Ensure SSL is enabled for cloud databases
       useSSL: true,
-
     );
 
     print('Attempting to connect to PostgreSQL...');
@@ -85,29 +79,23 @@ void main() async {
   // Get port (used for local binding)
   final port = int.parse(Platform.environment['PORT'] ?? '8080');
 
-  // 🔑 FIX: Fetch the publicly accessible authority (SERVER_AUTHORITY)
-  // This value will be used directly for the verification link.
+  // Fetch the publicly accessible authority (SERVER_AUTHORITY)
   final serverHost = _getRequiredEnv('SERVER_AUTHORITY');
 
-  // Fetch all required SMTP environment variables
-  final smtpHost = _getRequiredEnv('SMTP_HOST');
-  final smtpPort = int.parse(_getRequiredEnv('SMTP_PORT'));
-  final smtpUsername = _getRequiredEnv('SMTP_USERNAME');
-  final smtpPassword = _getRequiredEnv('SMTP_PASSWORD');
-  final smtpSsl = _getRequiredEnv('SMTP_SSL').toLowerCase() == 'true';
+  // 🔑 START OF CRITICAL FIX BLOCK (Removed SMTP, using API Key)
+  // Fetch the SendGrid API Key (stored in the old SMTP_PASSWORD variable)
+  final sendGridApiKey = _getRequiredEnv('SMTP_PASSWORD');
   final senderEmail = _getRequiredEnv('SENDER_EMAIL');
 
-  print('LOG: SMTP Configuration - Host: $smtpHost, Port: $smtpPort, User: $smtpUsername, SSL: $smtpSsl');
+  print('LOG: SendGrid Configuration - Host: api.sendgrid.com, User: apikey, Key Loaded.');
 
-  // Initialize the EmailService with all required named arguments
+  // Initialize the EmailService with the new, required API arguments
   final emailService = EmailService(
-    smtpHost: smtpHost,
-    smtpPort: smtpPort,
-    smtpUsername: smtpUsername,
-    smtpPassword: smtpPassword,
-    smtpSsl: smtpSsl,
+    sendGridApiKey: sendGridApiKey, // The SendGrid API Key
     senderEmail: senderEmail,
+    serverHost: serverHost,         // The host used to generate the verification link
   );
+  // 🔑 END OF CRITICAL FIX BLOCK
 
   // Pass the initialized services to the AuthService
   final authService = BackendAuthService(dbConnection, emailService, serverHost);
