@@ -1,28 +1,26 @@
+// bin/server.dart
+
 import 'dart:io';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
 import 'package:shelf_router/shelf_router.dart';
-import 'package:postgres/postgres.dart';
+import 'package:postgres/postgres.dart'; // Ensure this import brings in SslMode
 import 'package:dotenv/dotenv.dart' as env_helper;
 
 // Fix path to use the package alias
 import 'package:jersey_premier_league_backend/services/auth_service.dart';
 
 // --- Configuration Fix ---
-// Explicitly define the IP address of the hotspot interface.
-// This forces the server to bind to this specific network interface.
+// This HOTSPOT_IP is now only used for reference, not the link construction.
 const String HOTSPOT_IP = '192.168.137.52';
+// 🔑 REMOVED: const String LOCAL_IP = 'localhost';
 // ---
 
 // --- Environment Initialization ---
-// Initialize the DotEnv object and load variables from .env file immediately.
 final env = env_helper.DotEnv(includePlatformEnvironment: true)..load();
 
 // --- Database Initialization and Connection ---
-
-// Helper to get an environment variable or throw a descriptive error
 String _getRequiredEnv(String key) {
-  // Access the top-level 'env' map which is already loaded
   final value = env[key];
   if (value == null || value.isEmpty) {
     throw Exception('Missing required environment variable: $key. Please check your .env file.');
@@ -31,9 +29,6 @@ String _getRequiredEnv(String key) {
 }
 
 Future<PostgreSQLConnection> _initializeDatabase() async {
-  // NO NEED TO CALL env.load() HERE, it's done at the top-level
-
-  // Use the helper function for robust error handling
   try {
     final dbHost = _getRequiredEnv('DB_HOST');
     final dbPortString = _getRequiredEnv('DB_PORT');
@@ -41,7 +36,6 @@ Future<PostgreSQLConnection> _initializeDatabase() async {
     final dbUser = _getRequiredEnv('DB_USER');
     final dbPassword = _getRequiredEnv('DB_PASSWORD');
 
-    // Parse the port separately
     final dbPort = int.parse(dbPortString);
 
     final conn = PostgreSQLConnection(
@@ -50,15 +44,15 @@ Future<PostgreSQLConnection> _initializeDatabase() async {
       dbName,
       username: dbUser,
       password: dbPassword,
-      // sslMode: SslMode.prefer,
+      // 🔑 CRITICAL FIX: SslMode.require forces the secure connection Neon needs.
+      useSSL: true,
+
     );
 
     print('Attempting to connect to PostgreSQL...');
     await conn.open();
     print('Successfully connected to PostgreSQL!');
 
-    // Read and execute the schema initialization script
-    // NOTE: Ensure 'db/db_setup.sql' contains pure SQL without psql meta-commands (\).
     final schemaSql = await File('db/db_setup.sql').readAsString();
     print('Initializing database schema...');
 
@@ -74,7 +68,7 @@ Future<PostgreSQLConnection> _initializeDatabase() async {
     exit(1);
   } on PostgreSQLException catch (e) {
     print('FATAL ERROR: Failed to initialize database: $e');
-    print('Please check your PostgreSQL server status, database name, and credentials in the .env file.');
+    print('If the error is "connection is insecure" or "no SSL", you must update the postgres package.');
     exit(1);
   } catch (e) {
     print('FATAL ERROR: An unknown error occurred during database setup. Details: $e');
@@ -86,21 +80,48 @@ Future<PostgreSQLConnection> _initializeDatabase() async {
 
 void main() async {
   final dbConnection = await _initializeDatabase();
-  final authService = BackendAuthService(dbConnection);
+
+  // Get port (used for local binding)
+  final port = int.parse(Platform.environment['PORT'] ?? '8080');
+
+  // 🔑 FIX: Fetch the publicly accessible authority (SERVER_AUTHORITY)
+  // This value will be used directly for the verification link.
+  final serverHost = _getRequiredEnv('SERVER_AUTHORITY');
+
+  // Fetch all required SMTP environment variables
+  final smtpHost = _getRequiredEnv('SMTP_HOST');
+  final smtpPort = int.parse(_getRequiredEnv('SMTP_PORT'));
+  final smtpUsername = _getRequiredEnv('SMTP_USERNAME');
+  final smtpPassword = _getRequiredEnv('SMTP_PASSWORD');
+  final smtpSsl = _getRequiredEnv('SMTP_SSL').toLowerCase() == 'true';
+  final senderEmail = _getRequiredEnv('SENDER_EMAIL');
+
+  print('LOG: SMTP Configuration - Host: $smtpHost, Port: $smtpPort, User: $smtpUsername, SSL: $smtpSsl');
+
+  // Initialize the EmailService with all required named arguments
+  final emailService = EmailService(
+    smtpHost: smtpHost,
+    smtpPort: smtpPort,
+    smtpUsername: smtpUsername,
+    smtpPassword: smtpPassword,
+    smtpSsl: smtpSsl,
+    senderEmail: senderEmail,
+  );
+
+  // Pass the initialized services to the AuthService
+  final authService = BackendAuthService(dbConnection, emailService, serverHost);
 
   final appRouter = Router();
 
   // Public Routes (No authentication required)
   appRouter.post('/api/register', authService.registerHandler);
   appRouter.post('/api/login', authService.loginHandler);
+  appRouter.get('/api/verify', authService.verifyEmailHandler);
 
   // Protected Routes (Authentication required via JWT)
   appRouter.post('/api/profile/update', authService.updateProfileHandler);
   appRouter.post('/api/password/change', authService.changePasswordHandler);
-
   appRouter.post('/api/auth/google', authService.googleLoginHandler);
-
-// ...
 
   // CORS Middleware setup
   final handler = const Pipeline()
@@ -109,22 +130,17 @@ void main() async {
       .addHandler(appRouter);
 
   // Start the server
-  final port = int.parse(Platform.environment['PORT'] ?? '8080');
-
-  // --- CRITICAL BINDING FIX ---
-  // We use the explicit HOTSPOT_IP instead of InternetAddress.anyIPv4 to ensure
-  // the server correctly binds to the interface created by the mobile hotspot.
+  // Note: Serving on InternetAddress.anyIPv4 allows all network access (local and public).
   final server = await io.serve(handler, InternetAddress.anyIPv4, port);
-  // ---------------------------
 
   print('Server listening on http://${server.address.host}:${server.port}');
-  print('Ready to handle requests from your Flutter app.');
+  print('Verification links will use: http://$serverHost/api/verify');
 }
 
 // Middleware to handle CORS (Cross-Origin Resource Sharing)
 Middleware _corsHeaders() {
   const corsHeaders = {
-    'Access-Control-Allow-Origin': '*', // Allows all origins
+    'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Origin, Content-Type, Authorization',
   };
@@ -132,7 +148,6 @@ Middleware _corsHeaders() {
   return (Handler inner) {
     return (Request request) async {
       if (request.method == 'OPTIONS') {
-        // Handle CORS preflight requests
         return Response.ok(null, headers: corsHeaders);
       }
       final response = await inner(request);

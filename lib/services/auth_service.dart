@@ -5,25 +5,98 @@ import 'package:shelf/shelf.dart';
 import 'package:postgres/postgres.dart';
 import 'package:bcrypt/bcrypt.dart';
 import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
-import 'package:jersey_premier_league_backend/models/user.dart'; // Assuming this is correct
+import 'package:jersey_premier_league_backend/models/user.dart';
 import 'package:http/http.dart' as http;
+import 'dart:math';
 
+import 'package:mailer/mailer.dart';
+import 'package:mailer/smtp_server.dart';
 
-// A secret key for signing JWTs. In a real production app, load this securely
-// from an environment variable and make it much more complex.
+// A secret key for signing JWTs.
 const String _jwtSecret = 'supersecretjwtkeyforjplapp';
 
+
+// 🔑 MODIFIED CLASS: Email Service for sending actual emails
+class EmailService {
+  final SmtpServer _smtpServer;
+  final String _senderEmail; // NOW STORES the SENDER_EMAIL from .env
+
+  EmailService({
+    required String smtpHost,
+    required int smtpPort,
+    required String smtpUsername, // Used for authentication (e.g., Mailtrap token)
+    required String smtpPassword,
+    required bool smtpSsl,
+    required String senderEmail, // The email address to display in the 'From' field
+  })  : _senderEmail = senderEmail, // Assign the proper sender email
+        _smtpServer = SmtpServer(
+          smtpHost,
+          port: smtpPort,
+          username: smtpUsername,
+          password: smtpPassword,
+          ssl: smtpSsl,
+        );
+
+
+  Future<void> sendVerificationEmail({
+    required String recipientEmail,
+    required String verificationToken,
+    required String serverHost, // e.g., '192.168.137.52:8080'
+  }) async {
+    final verificationLink = 'http://$serverHost/api/verify?token=$verificationToken';
+
+    print('LOG: Starting email send to $recipientEmail. Link: $verificationLink');
+
+    final message = Message()
+    // FIX: Uses _senderEmail (e.g., jpl.support@example.com) for the 'From' address.
+      ..from = Address(_senderEmail, 'JPL Support')
+      ..recipients.add(recipientEmail)
+      ..subject = 'Jersey Premier League - Account Verification'
+      ..html = '''
+        <p>Thank you for registering for the Jersey Premier League!</p>
+        <p>Please click the link below to verify your email address:</p>
+        <p><a href="$verificationLink">$verificationLink</a></p>
+        <p>If you did not sign up for this account, please ignore this email.</p>
+        <p>Best regards,<br>The JPL Team</p>
+      ''';
+
+    try {
+      await send(message, _smtpServer);
+      print('LOG: Message sent successfully to $recipientEmail!');
+
+    } on MailerException catch (e) {
+      print('!!! CRITICAL ERROR: Message not sent. MailerException details:');
+      // 🔑 CRITICAL FIX: Print every problem code and message for detailed debugging
+      for (var p in e.problems) {
+        print('Problem Code: ${p.code}, Message: ${p.msg}');
+      }
+      throw Exception('Failed to send verification email.');
+
+    } catch (e, stackTrace) {
+      print('!!! CRITICAL ERROR: Unexpected error sending email: $e');
+      print('Stack Trace: $stackTrace');
+      throw Exception('Failed to send verification email due to an unexpected error: $e');
+    }
+  }
+}
+
+
 /// Service class responsible for handling all authentication-related logic
-/// and database interactions for the backend.
 class BackendAuthService {
-  // This private field holds the live connection to the PostgreSQL database.
   final PostgreSQLConnection _dbConnection;
+  final EmailService _emailService;
+  final String _serverHost;
 
-  BackendAuthService(this._dbConnection);
+  BackendAuthService(this._dbConnection, this._emailService, this._serverHost);
 
-  // --- PRIVATE HELPER FUNCTIONS ---
+  // ... (All helper functions and API handlers follow below) ...
 
-  /// Helper to create a standardized JSON response.
+  String _generateVerificationToken() {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    final random = Random.secure();
+    return List.generate(32, (index) => chars[random.nextInt(chars.length)]).join();
+  }
+
   Response _jsonResponse(int statusCode, Map<String, dynamic> body) {
     return Response(
       statusCode,
@@ -32,7 +105,6 @@ class BackendAuthService {
     );
   }
 
-  /// Extracts the JWT from the 'Authorization: Bearer <token>' header.
   String? _extractToken(Request request) {
     final authHeader = request.headers['authorization'];
     if (authHeader != null && authHeader.startsWith('Bearer ')) {
@@ -41,17 +113,28 @@ class BackendAuthService {
     return null;
   }
 
-  // REQUIRED FIX: Adds the missing _verifyToken helper function
-  // which is used by changePasswordHandler and updateProfileHandler.
   JWT _verifyToken(String token) {
     try {
       return JWT.verify(token, SecretKey(_jwtSecret));
     } on JWTExpiredException {
-      // Re-throw the specific exception to be caught by the handler
       throw JWTExpiredException();
     } on JWTException {
-      // Re-throw a generic JWT exception
       throw JWTException('Invalid token');
+    }
+  }
+
+  Future<Map<String, dynamic>?> _validateToken(Request request) async {
+    final token = _extractToken(request);
+    if (token == null) return null;
+
+    try {
+      final jwt = _verifyToken(token);
+      if (jwt.payload is Map<String, dynamic>) {
+        return jwt.payload as Map<String, dynamic>;
+      }
+      return null;
+    } on JWTException {
+      return null;
     }
   }
 
@@ -59,83 +142,87 @@ class BackendAuthService {
   // --- API HANDLERS ---
 
   /// Handles POST /api/register
-  /// Creates a new user in the database.
   Future<Response> registerHandler(Request request) async {
     try {
-      final body = json.decode(await request.readAsString());
+      final bodyString = await request.readAsString();
+      print('LOG: Register attempt received. Body: $bodyString');
+
+      final body = json.decode(bodyString);
       final name = body['name'] as String?;
-      final emailInput = body['email'] as String?; // Original email input
+      final emailInput = body['email'] as String?;
       final password = body['password'] as String?;
 
       if (name == null || emailInput == null || password == null) {
+        print('LOG: Registration failed - Missing required fields');
         return _jsonResponse(400, {'error': 'Missing required fields: name, email, password'});
       }
 
-      // Standardize to lowercase
       final email = emailInput.toLowerCase();
 
-      // Check if user already exists (Case-Insensitive Check)
       final existingUser = await _dbConnection.query(
         "SELECT id FROM users WHERE LOWER(email) = @email LIMIT 1",
         substitutionValues: {'email': email},
       );
 
       if (existingUser.isNotEmpty) {
+        print('LOG: Registration failed - Email already exists: $email');
         return _jsonResponse(409, {'error': 'User with this email already exists'});
       }
 
-      // Hash the password for secure storage
       final hashedPassword = BCrypt.hashpw(password, BCrypt.gensalt());
+      final verificationToken = _generateVerificationToken();
 
-      // Insert new user into the database. Storing the standardized (lowercase) email.
       final result = await _dbConnection.query(
-        "INSERT INTO users (name, email, password_hash) VALUES (@name, @email, @hash) RETURNING id, name, email, fpl_team_id",
+        "INSERT INTO users (name, email, password_hash, is_email_verified, verification_token) VALUES (@name, @email, @hash, FALSE, @token) RETURNING id, name, email, fpl_team_id, is_email_verified",
         substitutionValues: {
           'name': name,
-          'email': email, // Save the lowercase version
+          'email': email,
           'hash': hashedPassword,
+          'token': verificationToken,
         },
       );
+      print('LOG: User successfully inserted into database: $email');
 
-      // Send back the User object and a JWT token
       final newUserRow = result.first.toColumnMap();
       final user = BackendUser.fromPostgreSQL(newUserRow);
 
-      // Generate a JWT
-      final jwt = JWT({'id': user.id, 'email': user.email});
-      final token = jwt.sign(SecretKey(_jwtSecret), expiresIn: Duration(days: 7));
+      // Send the actual email
+      try {
+        await _emailService.sendVerificationEmail(
+          recipientEmail: user.email,
+          verificationToken: verificationToken,
+          serverHost: _serverHost,
+        );
+        print('LOG: Email service completed successfully for ${user.email}');
+      } catch (e) {
+        print('!!! FAILED TO SEND EMAIL: $e');
+      }
 
-      // Combine user data and the token for the client response
-      final userWithToken = user.toJson()..['token'] = token;
-
-      return _jsonResponse(201, userWithToken);
+      return _jsonResponse(201, user.toJson()..['message'] = 'User registered. Please check your email for verification.');
     } on PostgreSQLException catch (e) {
-      print('PostgreSQL Error during Registration: $e');
+      print('!!! PostgreSQL Error during Registration: $e');
       return _jsonResponse(500, {'error': 'Database error: Could not register user.'});
     } catch (e) {
-      print('Registration Error: $e');
+      print('!!! Registration Error (Unhandled): $e');
       return _jsonResponse(500, {'error': 'An internal server error occurred'});
     }
   }
 
   /// Handles POST /api/login
-  /// Authenticates a user and returns their data along with a JWT.
   Future<Response> loginHandler(Request request) async {
     try {
       final body = json.decode(await request.readAsString());
-      final emailInput = body['email'] as String?; // Original email input
+      final emailInput = body['email'] as String?;
       final password = body['password'] as String?;
 
       if (emailInput == null || password == null) {
         return _jsonResponse(400, {'error': 'Missing required fields: email, password'});
       }
 
-      // Standardize to lowercase
       final email = emailInput.toLowerCase();
 
-      // Query database using LOWER() for case-insensitive matching
       final result = await _dbConnection.query(
-        "SELECT id, name, email, password_hash, fpl_team_id FROM users WHERE LOWER(email) = @email LIMIT 1",
+        "SELECT id, name, email, password_hash, fpl_team_id, is_email_verified FROM users WHERE LOWER(email) = @email LIMIT 1",
         substitutionValues: {'email': email},
       );
 
@@ -143,22 +230,18 @@ class BackendAuthService {
         return _jsonResponse(401, {'error': 'Invalid email or password'});
       }
 
-      // Get the first (and only) row
       final userRow = result.first.toColumnMap();
       final storedHash = userRow['password_hash'] as String;
 
-      // Verify the provided password against the stored hash
       if (!BCrypt.checkpw(password, storedHash)) {
         return _jsonResponse(401, {'error': 'Invalid email or password'});
       }
 
-      // Generate a JWT
       final user = BackendUser.fromPostgreSQL(userRow);
-      // The JWT payload contains minimal data to identify the user
-      final jwt = JWT({'id': user.id, 'email': user.email});
+
+      final jwt = JWT({'id': user.id, 'email': user.email, 'verified': user.isEmailVerified});
       final token = jwt.sign(SecretKey(_jwtSecret), expiresIn: Duration(days: 7));
 
-      // Combine user data and the token for the client response
       final userWithToken = user.toJson()..['token'] = token;
 
       return _jsonResponse(200, userWithToken);
@@ -171,188 +254,152 @@ class BackendAuthService {
     }
   }
 
-  /// Handles POST /api/profile/update
-  /// A protected route that updates the user's FPL Team ID and/or name.
-  Future<Response> updateProfileHandler(Request request) async {
+  /// Handles GET /api/verify
+  Future<Response> verifyEmailHandler(Request request) async {
     try {
-      final token = _extractToken(request);
-      if (token == null) {
-        return _jsonResponse(401, {'error': 'Unauthorized: No token provided'});
+      final queryParams = request.url.queryParameters;
+      final token = queryParams['token'];
+
+      if (token == null || token.isEmpty) {
+        return Response.badRequest(body: 'Missing verification token');
       }
 
-      // Verify the JWT to authenticate the user
-      final jwt = _verifyToken(token);
-      final payload = jwt.payload as Map<String, dynamic>;
-
-      // The ID from the JWT payload is the user's INTEGER ID.
-      final userId = payload['id'] as int;
-
-      final body = json.decode(await request.readAsString());
-      final fplTeamId = body['fpl_team_ID'] as String?;
-      final name = body['name'] as String?;
-
-      if (fplTeamId == null && name == null) {
-        return _jsonResponse(400, {'error': 'Missing required fields: fpl_team_ID or name'});
-      }
-
-      // ⚡ CRITICAL FIX: FPL Team ID Uniqueness Check
-      if (fplTeamId != null && fplTeamId.isNotEmpty) {
-        // Check if this FPL Team ID is already in use by ANY OTHER user (NOT the current user)
-        final conflictCheck = await _dbConnection.query(
-          "SELECT id FROM users WHERE fpl_team_id = @fplTeamId AND id != @userId LIMIT 1",
-          substitutionValues: {
-            'fplTeamId': fplTeamId,
-            'userId': userId,
-          },
-        );
-
-        if (conflictCheck.isNotEmpty) {
-          // Return a specific 409 Conflict status with the expected error code
-          return _jsonResponse(409, {
-            'error': 'This FPL Team ID is already in use by another user.',
-            'code': 'FPL_TEAM_ID_EXISTS', // Client side relies on this code
-          });
-        }
-      }
-      // -----------------------------------------------------
-
-      // Start building the update query parts
-      final List<String> setClauses = [];
-      final Map<String, dynamic> substitutionValues = {'userId': userId};
-
-      if (fplTeamId != null) {
-        setClauses.add("fpl_team_id = @fplTeamId");
-        substitutionValues['fplTeamId'] = fplTeamId;
-      }
-      if (name != null) {
-        setClauses.add("name = @name");
-        substitutionValues['name'] = name;
-      }
-
-      // If no fields are actually being set, return a success message without updating
-      if (setClauses.isEmpty) {
-        return _jsonResponse(200, {'message': 'No changes detected or fields were empty.'});
-      }
-
-      // Execute the update
-      final updateSql = "UPDATE users SET ${setClauses.join(', ')} WHERE id = @userId";
-
-      final result = await _dbConnection.execute(
-        updateSql,
-        substitutionValues: substitutionValues,
+      final resultCount = await _dbConnection.execute(
+        "UPDATE users SET is_email_verified = TRUE, verification_token = NULL WHERE verification_token = @token AND is_email_verified = FALSE",
+        substitutionValues: {'token': token},
       );
 
-      if (result == 0) {
-        return _jsonResponse(404, {'error': 'User not found or no changes made'});
+      if (resultCount == 0) {
+        return Response.notFound('<h1>Verification Failed</h1><p>Invalid, expired, or already-used verification link.</p>', headers: {'Content-Type': 'text/html'});
       }
 
-      // Fetch the updated user row to return the actual saved data
-      final updatedUserRow = await _dbConnection.query(
-        "SELECT id, name, email, fpl_team_id FROM users WHERE id = @userId",
-        substitutionValues: {'userId': userId},
-      );
+      return Response.ok('<h1>Success!</h1><p>Email verified successfully! You can now close this window and log in to the app.</p>', headers: {'Content-Type': 'text/html'});
 
-      if (updatedUserRow.isEmpty) {
-        return _jsonResponse(500, {'error': 'Internal error: Could not fetch updated user.'});
-      }
-
-      // Convert to the model
-      final user = BackendUser.fromPostgreSQL(updatedUserRow.first.toColumnMap());
-
-      // Return the updated fields so the client can confirm the change
-      final Map<String, dynamic> responseBody = {
-        'message': 'Profile updated successfully',
-        'name': user.name,
-        // ⚡ FIX: The BackendUser model uses 'fplTeamID' (camelCase)
-        // The response JSON uses 'fpl_team_ID' (snake_case)
-        'fpl_team_ID': user.fplTeamID,
-      };
-
-      return _jsonResponse(200, responseBody);
-
-    } on JWTExpiredException {
-      return _jsonResponse(401, {'error': 'Unauthorized: Token has expired'});
-    } on JWTException catch (e) {
-      // Handles invalid signature, invalid claims, etc.
-      return _jsonResponse(401, {'error': 'Unauthorized: Invalid token (${e.message})'});
     } on PostgreSQLException catch (e) {
-      print('PostgreSQL Error during Update: $e');
-      return _jsonResponse(500, {'error': 'Database error during profile update.'});
+      print('PostgreSQL Error during Verification: $e');
+      return _jsonResponse(500, {'error': 'Database error during verification.'});
     } catch (e) {
-      print('Profile Update Error: $e');
+      print('Verification Error: $e');
       return _jsonResponse(500, {'error': 'An internal server error occurred'});
     }
   }
 
-  /// Handles POST /api/password/change
-  /// A protected route that allows a user to update their password.
-  Future<Response> changePasswordHandler(Request request) async {
-    final token = _extractToken(request);
-    if (token == null) {
-      return _jsonResponse(401, {'error': 'Unauthorized: Missing token'});
+  /// HANDLER: Handles POST /api/profile/update
+  Future<Response> updateProfileHandler(Request request) async {
+    final payload = await _validateToken(request);
+    if (payload == null) {
+      return _jsonResponse(401, {'error': 'Unauthorized: Invalid or missing token'});
     }
 
     try {
-      // 1. Verify token and extract user ID
-      final jwt = _verifyToken(token);
-      final userId = jwt.payload['id'] as int;
-
+      final userID = payload['id'] as int;
       final body = json.decode(await request.readAsString());
-      final currentPassword = body['current_password'] as String?;
-      final newPassword = body['new_password'] as String?;
+      final newName = body['name'] as String?;
+      final newFplTeamID = body['fpl_team_ID'] as String?;
 
-      if (currentPassword == null || newPassword == null) {
-        return _jsonResponse(400, {'error': 'Missing current password or new password'});
-      }
-      if (newPassword.length < 6) {
-        return _jsonResponse(400, {'error': 'New password must be at least 6 characters'});
+      if (newName == null && newFplTeamID == null) {
+        return _jsonResponse(400, {'error': 'No fields provided for update.'});
       }
 
-      // 2. Fetch user to verify current password
+      final updates = <String, dynamic>{};
+      final updateClauses = <String>[];
+
+      if (newName != null) {
+        updateClauses.add('name = @name');
+        updates['name'] = newName;
+      }
+
+      if (newFplTeamID != null) {
+        final existingFplId = await _dbConnection.query(
+          "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
+          substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
+        );
+
+        if (existingFplId.isNotEmpty) {
+          return _jsonResponse(409, {'error': 'FPL_TEAM_ID_EXISTS'});
+        }
+
+        updateClauses.add('fpl_team_id = @fplId');
+        updates['fplId'] = newFplTeamID;
+      }
+
+      updates['userId'] = userID;
+
       final result = await _dbConnection.query(
-        'SELECT password_hash FROM users WHERE id = @id',
-        substitutionValues: {'id': userId},
+        "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
+        substitutionValues: updates,
       );
 
       if (result.isEmpty) {
         return _jsonResponse(404, {'error': 'User not found'});
       }
 
-      final storedHash = result.first[0] as String;
+      final updatedUserRow = result.first.toColumnMap();
+      final user = BackendUser.fromPostgreSQL(updatedUserRow);
 
-      // 3. Verify current password
-      if (!BCrypt.checkpw(currentPassword, storedHash)) {
-        // Correctly uses 401 for an authentication failure
-        return _jsonResponse(401, {'error': 'Incorrect current password'});
-      }
+      return _jsonResponse(200, user.toJson()..['message'] = 'Profile updated successfully');
 
-      // 4. Hash the new password
-      final newPasswordHash = BCrypt.hashpw(newPassword, BCrypt.gensalt());
-
-      // 5. Update the password hash in the database
-      await _dbConnection.execute(
-        'UPDATE users SET password_hash = @hash WHERE id = @id',
-        substitutionValues: {
-          'hash': newPasswordHash,
-          'id': userId,
-        },
-      );
-
-      return _jsonResponse(200, {'message': 'Password changed successfully'});
-
-    } on JWTExpiredException {
-      return _jsonResponse(401, {'error': 'Unauthorized: Token has expired'});
-    } on JWTException catch (e) {
-      return _jsonResponse(401, {'error': 'Unauthorized: Invalid token (${e.message})'});
     } on PostgreSQLException catch (e) {
-      print('PostgreSQL Error during Password Change: $e');
-      return _jsonResponse(500, {'error': 'Server error during password update'});
+      print('PostgreSQL Error during Profile Update: $e');
+      return _jsonResponse(500, {'error': 'Database error during profile update.'});
     } catch (e) {
-      print('Password Change Error: $e');
-      return _jsonResponse(500, {'error': 'An unknown server error occurred'});
+      print('Profile Update Error: $e');
+      return _jsonResponse(500, {'error': 'Internal server error'});
     }
   }
 
+
+  /// HANDLER: Handles POST /api/password/change
+  Future<Response> changePasswordHandler(Request request) async {
+    final payload = await _validateToken(request);
+    if (payload == null) {
+      return _jsonResponse(401, {'error': 'Unauthorized: Invalid or missing token'});
+    }
+
+    try {
+      final userID = payload['id'] as int;
+      final body = json.decode(await request.readAsString());
+      final currentPassword = body['current_password'] as String?;
+      final newPassword = body['new_password'] as String?;
+
+      if (currentPassword == null || newPassword == null) {
+        return _jsonResponse(400, {'error': 'Missing current or new password.'});
+      }
+
+      final result = await _dbConnection.query(
+        "SELECT password_hash FROM users WHERE id = @userId LIMIT 1",
+        substitutionValues: {'userId': userID},
+      );
+
+      if (result.isEmpty) {
+        return _jsonResponse(404, {'error': 'User not found'});
+      }
+
+      final storedHash = result.first.toColumnMap()['password_hash'] as String;
+
+      if (!BCrypt.checkpw(currentPassword, storedHash)) {
+        return _jsonResponse(401, {'error': 'Incorrect current password'});
+      }
+
+      final newHashedPassword = BCrypt.hashpw(newPassword, BCrypt.gensalt());
+
+      await _dbConnection.execute(
+        "UPDATE users SET password_hash = @newHash WHERE id = @userId",
+        substitutionValues: {'newHash': newHashedPassword, 'userId': userID},
+      );
+
+      return _jsonResponse(200, {'message': 'Password updated successfully'});
+
+    } on PostgreSQLException catch (e) {
+      print('PostgreSQL Error during Password Change: $e');
+      return _jsonResponse(500, {'error': 'Database error during password change.'});
+    } catch (e) {
+      print('Password Change Error: $e');
+      return _jsonResponse(500, {'error': 'Internal server error'});
+    }
+  }
+
+  /// Handles POST /api/auth/google
   Future<Response> googleLoginHandler(Request request) async {
     try {
       final body = json.decode(await request.readAsString());
@@ -362,14 +409,12 @@ class BackendAuthService {
         return _jsonResponse(400, {'error': 'Missing Google ID token'});
       }
 
-      // 1. Securely Verify the Google ID Token
       final verificationUrl = Uri.parse(
           'https://oauth2.googleapis.com/tokeninfo?id_token=$idToken');
 
       final verificationResponse = await http.get(verificationUrl);
 
       if (verificationResponse.statusCode != 200) {
-        // Token is invalid, expired, or malformed
         return _jsonResponse(401, {'error': 'Invalid or expired Google ID token.'});
       }
 
@@ -377,32 +422,30 @@ class BackendAuthService {
       final email = googleUserPayload['email'] as String?;
       final name = googleUserPayload['name'] as String?;
 
-      // Critical Check: Ensure email is present and verified
-      if (email == null || googleUserPayload['email_verified'] != 'true') {
+      final bool isVerifiedByGoogle = googleUserPayload['email_verified'] == 'true';
+      if (email == null || !isVerifiedByGoogle) {
         return _jsonResponse(401, {'error': 'Google email not verified.'});
       }
 
-      // 2. Check if user already exists in your database
+      // Check for existing user
       final existingUserResult = await _dbConnection.query(
-        "SELECT id, name, email, fpl_team_id FROM users WHERE LOWER(email) = @email LIMIT 1",
+        "SELECT id, name, email, fpl_team_id, is_email_verified FROM users WHERE LOWER(email) = @email LIMIT 1",
         substitutionValues: {'email': email},
       );
 
       BackendUser user;
 
       if (existingUserResult.isNotEmpty) {
-        // User exists: Log them in
+        // User exists
         final userRow = existingUserResult.first.toColumnMap();
         user = BackendUser.fromPostgreSQL(userRow);
       } else {
         // User does not exist: Register them automatically
-
-        // Google users don't need a password hash, but the column usually requires one.
-        // Use a flag or a very long dummy hash to denote external login.
         final dummyPasswordHash = BCrypt.hashpw('google_auth_placeholder', BCrypt.gensalt());
 
+        // Insert new user, marking them as verified by default since Google confirmed it
         final insertResult = await _dbConnection.query(
-          "INSERT INTO users (name, email, password_hash) VALUES (@name, @email, @hash) RETURNING id, name, email, fpl_team_id",
+          "INSERT INTO users (name, email, password_hash, is_email_verified) VALUES (@name, @email, @hash, TRUE) RETURNING id, name, email, fpl_team_id, is_email_verified",
           substitutionValues: {
             'name': name ?? 'Google User',
             'email': email,
@@ -413,8 +456,8 @@ class BackendAuthService {
         user = BackendUser.fromPostgreSQL(newUserRow);
       }
 
-      // 3. Generate and return your app's JWT
-      final jwt = JWT({'id': user.id, 'email': user.email});
+      // Generate JWT, including the verification status
+      final jwt = JWT({'id': user.id, 'email': user.email, 'verified': user.isEmailVerified});
       final token = jwt.sign(SecretKey(_jwtSecret), expiresIn: const Duration(days: 7));
 
       final userWithToken = user.toJson()..['token'] = token;
