@@ -474,6 +474,72 @@ class BackendAuthService {
     }
   }
 
+
+  /// HANDLER: Handles POST /api/password/change
+  Future<Response> changePasswordHandler(Request request) async {
+    final payload = await _validateToken(request);
+    if (payload == null) {
+      return _jsonResponse(401, {'error': 'Unauthorized: Invalid or missing token'});
+    }
+
+    try {
+      final userID = payload['id'] as int;
+      final body = json.decode(await request.readAsString());
+      final currentPassword = body['current_password'] as String?;
+      final newPassword = body['new_password'] as String?;
+
+      if (currentPassword == null || newPassword == null) {
+        return _jsonResponse(400, {'error': 'Missing current or new password.'});
+      }
+
+      // 🔑 CRITICAL FIX: Wrap all database operations in the request pool
+      final operationResult = await _requestPool.withResource(() async {
+
+        // 1. Fetch the password hash
+        final result = await _dbConnection.query(
+          "SELECT password_hash FROM users WHERE id = @userId LIMIT 1",
+          substitutionValues: {'userId': userID},
+        );
+
+        if (result.isEmpty) {
+          throw Exception('User not found');
+        }
+
+        final storedHash = result.first.toColumnMap()['password_hash'] as String;
+
+        if (!BCrypt.checkpw(currentPassword, storedHash)) {
+          throw Exception('Incorrect current password');
+        }
+
+        final newHashedPassword = BCrypt.hashpw(newPassword, BCrypt.gensalt());
+
+        // 2. Execute the update
+        await _dbConnection.execute(
+          "UPDATE users SET password_hash = @newHash WHERE id = @userId",
+          substitutionValues: {'newHash': newHashedPassword, 'userId': userID},
+        );
+
+        return true; // Return a success indicator
+
+      });
+
+      return _jsonResponse(200, {'message': 'Password updated successfully'});
+
+    } on PostgreSQLException catch (e) {
+      print('PostgreSQL Error during Password Change: $e');
+      return _jsonResponse(500, {'error': 'Database error during password change.'});
+    } catch (e) {
+      if (e.toString().contains('User not found')) {
+        return _jsonResponse(404, {'error': 'User not found'});
+      }
+      if (e.toString().contains('Incorrect current password')) {
+        return _jsonResponse(401, {'error': 'Incorrect current password'});
+      }
+      print('Password Change Error: $e');
+      return _jsonResponse(500, {'error': 'Internal server error'});
+    }
+  }
+
   /// Handles POST /api/auth/google
   Future<Response> googleLoginHandler(Request request) async {
     try {
