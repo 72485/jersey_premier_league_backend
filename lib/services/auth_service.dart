@@ -382,31 +382,40 @@ class BackendAuthService {
     try {
       final userID = payload['id'] as int;
       final body = json.decode(await request.readAsString());
-      final newName = body['name'] as String?;
 
-      // 🚨 FIX 1: Reverting key to match schema/Frontend.
-      // The key in the incoming JSON must match what the Frontend sends: 'fpl_team_ID'
+      // 1. Get incoming values. Assuming Frontend sends 'fpl_team_ID' (mixed case).
+      final newName = body['name'] as String?;
       final newFplTeamIDInput = body['fpl_team_ID'] as String?;
 
       if (newName == null && newFplTeamIDInput == null) {
         return _jsonResponse(400, {'error': 'No fields provided for update.'});
       }
 
-      final updates = <String, dynamic>{};
-      final updateClauses = <String>[];
+      // 2. Pre-process and validate inputs before entering the DB block
+      String? fplIdForDb;
+      if (newFplTeamIDInput != null) {
+        // Map empty string to NULL for nullable database column (clearing the field)
+        fplIdForDb = newFplTeamIDInput.isEmpty ? null : newFplTeamIDInput;
+      }
 
+      if (newName != null && newName.isEmpty) {
+        // Validation for the mandatory 'name' field
+        throw Exception('Name cannot be empty.');
+      }
+
+      // 3. Perform ALL DB operations inside a single, safe pool resource block
       final result = await _requestPool.withResource(() async {
+        final updates = <String, dynamic>{};
+        final updateClauses = <String>[];
 
+        updates['userId'] = userID;
+
+        // --- FPL ID Logic (Check and Clause) ---
         if (newFplTeamIDInput != null) {
 
-          // 🚨 FIX 2: Map empty string to null for the database column,
-          // which is standard for clearing an optional field.
-          final fplIdForDb = newFplTeamIDInput.isEmpty ? null : newFplTeamIDInput;
-
-          // Check for existing FPL ID only if a value is provided (not null)
+          // Check for duplicate FPL ID (only if providing a non-null ID)
           if (fplIdForDb != null) {
             final existingFplId = await _dbConnection.query(
-              // Use the unquoted column name for case-insensitive lookup
               "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
               substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
             );
@@ -416,30 +425,33 @@ class BackendAuthService {
             }
           }
 
-          // Add the update clause
+          // Build the update clause for FPL ID
           updateClauses.add('fpl_team_id = @fplId');
-          updates['fplId'] = fplIdForDb; // Use the value mapped to NULL or the ID string
+          updates['fplId'] = fplIdForDb;
         }
 
+        // --- Name Logic (Clause) ---
         if (newName != null) {
-          if (newName.isEmpty) {
-            // Prevent clearing the name if the column is NOT NULL
-            throw Exception('Name cannot be empty.');
-          }
           updateClauses.add('name = @name');
           updates['name'] = newName;
         }
 
-        updates['userId'] = userID;
+        // Check if any clause was actually added
+        if (updateClauses.isEmpty) {
+          return null; // Signal that no changes were necessary
+        }
 
-        // Perform the update query
-        // 🚨 FIX 3: Using the unquoted column names throughout the query,
-        // which PostgreSQL will case-fold to the schema's fpl_team_ID.
+        // Final execution of the UPDATE query
         return _dbConnection.query(
           "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
           substitutionValues: updates,
         );
       });
+
+      // 4. Handle result and send response
+      if (result == null) {
+        return _jsonResponse(200, {'message': 'Profile already up to date (no changes detected).'});
+      }
 
       if (result.isEmpty) {
         return _jsonResponse(404, {'error': 'User not found'});
@@ -448,7 +460,7 @@ class BackendAuthService {
       final updatedUserRow = result.first.toColumnMap();
       final user = BackendUser.fromPostgreSQL(updatedUserRow);
 
-      // Regenerate JWT and include it in the response (same as before)
+      // Regenerate JWT and include it in the response
       final jwt = JWT({'id': user.id, 'email': user.email, 'verified': user.isEmailVerified});
       final token = jwt.sign(SecretKey(_jwtSecret), expiresIn: Duration(days: 7));
 
@@ -469,7 +481,6 @@ class BackendAuthService {
         return _jsonResponse(400, {'error': 'Name cannot be empty.'});
       }
       print('Profile Update Error: $e');
-      // Return a generic 500 for all other internal errors
       return _jsonResponse(500, {'error': 'Internal server error'});
     }
   }
