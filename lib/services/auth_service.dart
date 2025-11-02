@@ -306,7 +306,6 @@ class BackendAuthService {
   }
 
   // /// HANDLER: Handles POST /api/profile/fpl-team-id
-// Assumes this function is added alongside your other handlers
   Future<Response> updateFplTeamIdHandler(Request request) async {
     final payload = await _validateToken(request);
     if (payload == null) {
@@ -317,24 +316,25 @@ class BackendAuthService {
       final userID = payload['id'] as int;
       final body = json.decode(await request.readAsString());
 
-      // 🔑 NOTE: Using 'fpl_team_id' (lowercase) for standard JSON convention
-      final newFplTeamID = body['fpl_team_id'] as String?;
+      // NOTE: Using 'fpl_team_ID' (mixed case) to match Dart model/Frontend
+      final newFplTeamIDInput = body['fpl_team_ID'] as String?;
 
-      if (newFplTeamID == null) {
-        // The backend needs to know if the user wants to set it to null or if the field is missing.
-        // Since this is a setup page, we can assume the field must be present (or null if they clear it).
-        // If it's null, we allow it (to handle clearing the field), but if it's explicitly set to an empty string, we should fail fast.
-        // For setup, let's assume if it's null, we require it to be set.
+      if (newFplTeamIDInput == null) {
         return _jsonResponse(400, {'error': 'FPL Team ID is required.'});
       }
+
+      // Pre-process: Map empty string to NULL
+      final fplIdForDb = newFplTeamIDInput.isEmpty ? null : newFplTeamIDInput;
+
 
       final result = await _requestPool.withResource(() async {
 
         // Check for existing FPL ID only if a value is provided (not null)
-        if (newFplTeamID != null && newFplTeamID.isNotEmpty) {
+        if (fplIdForDb != null) {
           final existingFplId = await _dbConnection.query(
-            "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
-            substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
+            // 🚨 CRITICAL FIX: Quote the column name to force mixed-case matching the schema
+            "SELECT id FROM users WHERE \"fpl_team_ID\" = @fplId AND id != @userId LIMIT 1",
+            substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
           );
 
           if (existingFplId.isNotEmpty) {
@@ -342,11 +342,11 @@ class BackendAuthService {
           }
         }
 
-        // Perform the update query. The value can be a string or NULL (from Dart's null).
-        // The user must explicitly send NULL to clear the field.
+        // Perform the update query.
         return _dbConnection.query(
-          "UPDATE users SET fpl_team_id = @fplId WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
-          substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
+          // 🚨 CRITICAL FIX: Quote the column name in the UPDATE clause
+          "UPDATE users SET \"fpl_team_ID\" = @fplId WHERE id = @userId RETURNING id, name, email, \"fpl_team_ID\", is_email_verified",
+          substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
         );
       });
 
@@ -383,27 +383,26 @@ class BackendAuthService {
       final userID = payload['id'] as int;
       final body = json.decode(await request.readAsString());
 
-      // 1. Get incoming values. Assuming Frontend sends 'fpl_team_ID' (mixed case).
       final newName = body['name'] as String?;
+      // Key in JSON payload sent from frontend (must match Dart model)
       final newFplTeamIDInput = body['fpl_team_ID'] as String?;
 
       if (newName == null && newFplTeamIDInput == null) {
         return _jsonResponse(400, {'error': 'No fields provided for update.'});
       }
 
-      // 2. Pre-process and validate inputs before entering the DB block
+      // Pre-process and validate inputs
       String? fplIdForDb;
       if (newFplTeamIDInput != null) {
-        // Map empty string to NULL for nullable database column (clearing the field)
+        // Map empty string to NULL for nullable database column
         fplIdForDb = newFplTeamIDInput.isEmpty ? null : newFplTeamIDInput;
       }
 
       if (newName != null && newName.isEmpty) {
-        // Validation for the mandatory 'name' field
         throw Exception('Name cannot be empty.');
       }
 
-      // 3. Perform ALL DB operations inside a single, safe pool resource block
+      // Perform ALL DB operations inside a single, safe pool resource block
       final result = await _requestPool.withResource(() async {
         final updates = <String, dynamic>{};
         final updateClauses = <String>[];
@@ -416,7 +415,8 @@ class BackendAuthService {
           // Check for duplicate FPL ID (only if providing a non-null ID)
           if (fplIdForDb != null) {
             final existingFplId = await _dbConnection.query(
-              "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
+              // 🚨 CRITICAL FIX: Quote the column name to force mixed-case matching the schema
+              "SELECT id FROM users WHERE \"fpl_team_ID\" = @fplId AND id != @userId LIMIT 1",
               substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
             );
 
@@ -426,7 +426,8 @@ class BackendAuthService {
           }
 
           // Build the update clause for FPL ID
-          updateClauses.add('fpl_team_id = @fplId');
+          // 🚨 CRITICAL FIX: Quote the column name to force mixed-case matching the schema
+          updateClauses.add('"fpl_team_ID" = @fplId');
           updates['fplId'] = fplIdForDb;
         }
 
@@ -436,14 +437,14 @@ class BackendAuthService {
           updates['name'] = newName;
         }
 
-        // Check if any clause was actually added
         if (updateClauses.isEmpty) {
-          return null; // Signal that no changes were necessary
+          return null;
         }
 
         // Final execution of the UPDATE query
         return _dbConnection.query(
-          "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
+          // 🚨 CRITICAL FIX: Quote the column name in the RETURNING clause as well
+          "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, \"fpl_team_ID\", is_email_verified",
           substitutionValues: updates,
         );
       });
@@ -490,7 +491,7 @@ class BackendAuthService {
   Future<Response> changePasswordHandler(Request request) async {
     final payload = await _validateToken(request);
     if (payload == null) {
-      return _jsonResponse(401, {'error': 'Unauthorized: Invalid or missing token'});
+      throw Exception('Unauthorized: Invalid or missing token');
     }
 
     try {
