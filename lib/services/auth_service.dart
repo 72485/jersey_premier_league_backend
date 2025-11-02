@@ -307,7 +307,6 @@ class BackendAuthService {
 
   // /// HANDLER: Handles POST /api/profile/fpl-team-id
 // Assumes this function is added alongside your other handlers
-
   Future<Response> updateFplTeamIdHandler(Request request) async {
     final payload = await _validateToken(request);
     if (payload == null) {

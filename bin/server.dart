@@ -119,6 +119,9 @@ void main() async {
   appRouter.post('/api/profile/update', authService.updateProfileHandler);
   appRouter.post('/api/password/change', authService.changePasswordHandler);
   appRouter.post('/api/auth/google', authService.googleLoginHandler);
+  appRouter.post('/api/profile/fpl-team-id', authService.updateFplTeamIdHandler);
+
+
 
 
   // CORS Middleware setup
