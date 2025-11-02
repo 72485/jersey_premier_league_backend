@@ -34,7 +34,7 @@ class BackendUser {
       'id': id,
       'name': name,
       'email': email,
-      'fpl_team_ID': fplTeamID,
+      'fpl_team_id': fplTeamID,
       'is_email_verified': isEmailVerified, // 🆕 NEW
       // verificationToken is generally NOT sent to the client
     };
