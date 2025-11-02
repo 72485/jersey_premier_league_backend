@@ -403,6 +403,7 @@ class BackendAuthService {
         throw Exception('Name cannot be empty.');
       }
 
+
       // 3. Perform ALL DB operations inside a single, safe pool resource block
       final result = await _requestPool.withResource(() async {
         final updates = <String, dynamic>{};
@@ -427,7 +428,7 @@ class BackendAuthService {
 
           // Build the update clause for FPL ID
           updateClauses.add('fpl_team_id = @fplId');
-          updates['fplId'] = fplIdForDb;
+          updates['fplId'] = newFplTeamIDInput;
         }
 
         // --- Name Logic (Clause) ---
