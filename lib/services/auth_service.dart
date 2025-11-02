@@ -383,35 +383,49 @@ class BackendAuthService {
       final userID = payload['id'] as int;
       final body = json.decode(await request.readAsString());
       final newName = body['name'] as String?;
-      // 🚨 CRITICAL CHANGE: Switched key from 'fpl_team_ID' to 'fpl_team_id'
-      final newFplTeamID = body['fpl_team_id'] as String?;
 
-      if (newName == null && newFplTeamID == null) {
+      // 🚨 FIX 1: Reverting key to match schema/Frontend.
+      // The key in the incoming JSON must match what the Frontend sends: 'fpl_team_ID'
+      final newFplTeamIDInput = body['fpl_team_ID'] as String?;
+
+      if (newName == null && newFplTeamIDInput == null) {
         return _jsonResponse(400, {'error': 'No fields provided for update.'});
       }
 
       final updates = <String, dynamic>{};
       final updateClauses = <String>[];
 
-      // Use a single pool resource block for all DB operations in this handler
       final result = await _requestPool.withResource(() async {
 
-        if (newFplTeamID != null) {
-          // Check for existing FPL ID
-          final existingFplId = await _dbConnection.query(
-            "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
-            substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
-          );
+        if (newFplTeamIDInput != null) {
 
-          if (existingFplId.isNotEmpty) {
-            throw Exception('FPL_TEAM_ID_EXISTS');
+          // 🚨 FIX 2: Map empty string to null for the database column,
+          // which is standard for clearing an optional field.
+          final fplIdForDb = newFplTeamIDInput.isEmpty ? null : newFplTeamIDInput;
+
+          // Check for existing FPL ID only if a value is provided (not null)
+          if (fplIdForDb != null) {
+            final existingFplId = await _dbConnection.query(
+              // Use the unquoted column name for case-insensitive lookup
+              "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
+              substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
+            );
+
+            if (existingFplId.isNotEmpty) {
+              throw Exception('FPL_TEAM_ID_EXISTS');
+            }
           }
 
+          // Add the update clause
           updateClauses.add('fpl_team_id = @fplId');
-          updates['fplId'] = newFplTeamID;
+          updates['fplId'] = fplIdForDb; // Use the value mapped to NULL or the ID string
         }
 
         if (newName != null) {
+          if (newName.isEmpty) {
+            // Prevent clearing the name if the column is NOT NULL
+            throw Exception('Name cannot be empty.');
+          }
           updateClauses.add('name = @name');
           updates['name'] = newName;
         }
@@ -419,12 +433,13 @@ class BackendAuthService {
         updates['userId'] = userID;
 
         // Perform the update query
+        // 🚨 FIX 3: Using the unquoted column names throughout the query,
+        // which PostgreSQL will case-fold to the schema's fpl_team_ID.
         return _dbConnection.query(
           "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
           substitutionValues: updates,
         );
       });
-
 
       if (result.isEmpty) {
         return _jsonResponse(404, {'error': 'User not found'});
@@ -433,83 +448,28 @@ class BackendAuthService {
       final updatedUserRow = result.first.toColumnMap();
       final user = BackendUser.fromPostgreSQL(updatedUserRow);
 
-      return _jsonResponse(200, user.toJson()..['message'] = 'Profile updated successfully');
+      // Regenerate JWT and include it in the response (same as before)
+      final jwt = JWT({'id': user.id, 'email': user.email, 'verified': user.isEmailVerified});
+      final token = jwt.sign(SecretKey(_jwtSecret), expiresIn: Duration(days: 7));
+
+      final userWithToken = user.toJson()
+        ..['token'] = token
+        ..['message'] = 'Profile updated successfully';
+
+      return _jsonResponse(200, userWithToken);
 
     } on PostgreSQLException catch (e) {
       print('PostgreSQL Error during Profile Update: $e');
       return _jsonResponse(500, {'error': 'Database error during profile update.'});
     } catch (e) {
-      // Handle the custom exception thrown inside the pool block
       if (e.toString().contains('FPL_TEAM_ID_EXISTS')) {
         return _jsonResponse(409, {'error': 'FPL Team ID is already in use by another account.'});
       }
+      if (e.toString().contains('Name cannot be empty')) {
+        return _jsonResponse(400, {'error': 'Name cannot be empty.'});
+      }
       print('Profile Update Error: $e');
-      return _jsonResponse(500, {'error': 'Internal server error'});
-    }
-  }
-
-
-  /// HANDLER: Handles POST /api/password/change
-  Future<Response> changePasswordHandler(Request request) async {
-    final payload = await _validateToken(request);
-    if (payload == null) {
-      return _jsonResponse(401, {'error': 'Unauthorized: Invalid or missing token'});
-    }
-
-    try {
-      final userID = payload['id'] as int;
-      final body = json.decode(await request.readAsString());
-      final currentPassword = body['current_password'] as String?;
-      final newPassword = body['new_password'] as String?;
-
-      if (currentPassword == null || newPassword == null) {
-        return _jsonResponse(400, {'error': 'Missing current or new password.'});
-      }
-
-      // 🔑 CRITICAL FIX: Wrap all database operations in the request pool
-      final operationResult = await _requestPool.withResource(() async {
-
-        // 1. Fetch the password hash
-        final result = await _dbConnection.query(
-          "SELECT password_hash FROM users WHERE id = @userId LIMIT 1",
-          substitutionValues: {'userId': userID},
-        );
-
-        if (result.isEmpty) {
-          throw Exception('User not found');
-        }
-
-        final storedHash = result.first.toColumnMap()['password_hash'] as String;
-
-        if (!BCrypt.checkpw(currentPassword, storedHash)) {
-          throw Exception('Incorrect current password');
-        }
-
-        final newHashedPassword = BCrypt.hashpw(newPassword, BCrypt.gensalt());
-
-        // 2. Execute the update
-        await _dbConnection.execute(
-          "UPDATE users SET password_hash = @newHash WHERE id = @userId",
-          substitutionValues: {'newHash': newHashedPassword, 'userId': userID},
-        );
-
-        return true; // Return a success indicator
-
-      });
-
-      return _jsonResponse(200, {'message': 'Password updated successfully'});
-
-    } on PostgreSQLException catch (e) {
-      print('PostgreSQL Error during Password Change: $e');
-      return _jsonResponse(500, {'error': 'Database error during password change.'});
-    } catch (e) {
-      if (e.toString().contains('User not found')) {
-        return _jsonResponse(404, {'error': 'User not found'});
-      }
-      if (e.toString().contains('Incorrect current password')) {
-        return _jsonResponse(401, {'error': 'Incorrect current password'});
-      }
-      print('Password Change Error: $e');
+      // Return a generic 500 for all other internal errors
       return _jsonResponse(500, {'error': 'Internal server error'});
     }
   }
