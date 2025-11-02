@@ -325,11 +325,7 @@ class BackendAuthService {
         // Since this is a setup page, we can assume the field must be present (or null if they clear it).
         // If it's null, we allow it (to handle clearing the field), but if it's explicitly set to an empty string, we should fail fast.
         // For setup, let's assume if it's null, we require it to be set.
-        // The frontend must ensure it passes a non-null string if it wants to update, or an explicit null if it wants to clear.
-        // Given this is the mandatory setup page, we can enforce it cannot be null/empty.
-        if (newFplTeamID == null) {
-          return _jsonResponse(400, {'error': 'FPL Team ID is required.'});
-        }
+        return _jsonResponse(400, {'error': 'FPL Team ID is required.'});
       }
 
       final result = await _requestPool.withResource(() async {
@@ -347,6 +343,7 @@ class BackendAuthService {
         }
 
         // Perform the update query. The value can be a string or NULL (from Dart's null).
+        // The user must explicitly send NULL to clear the field.
         return _dbConnection.query(
           "UPDATE users SET fpl_team_id = @fplId WHERE id = @userId RETURNING id, name, email, fpl_team_id, is_email_verified",
           substitutionValues: {'fplId': newFplTeamID, 'userId': userID},
@@ -360,15 +357,7 @@ class BackendAuthService {
       final updatedUserRow = result.first.toColumnMap();
       final user = BackendUser.fromPostgreSQL(updatedUserRow);
 
-      // 🔑 CRITICAL FIX: Regenerate JWT and include it in the response
-      final jwt = JWT({'id': user.id, 'email': user.email, 'verified': user.isEmailVerified});
-      final token = jwt.sign(SecretKey(_jwtSecret), expiresIn: Duration(days: 7));
-
-      final userWithToken = user.toJson()
-        ..['token'] = token
-        ..['message'] = 'FPL Team ID updated successfully';
-
-      return _jsonResponse(200, userWithToken);
+      return _jsonResponse(200, user.toJson()..['message'] = 'FPL Team ID updated successfully');
 
     } on PostgreSQLException catch (e) {
       print('PostgreSQL Error during FPL ID Update: $e');
@@ -394,7 +383,8 @@ class BackendAuthService {
       final userID = payload['id'] as int;
       final body = json.decode(await request.readAsString());
       final newName = body['name'] as String?;
-      final newFplTeamID = body['fpl_team_ID'] as String?; // Note the snake_case for the key
+      // 🚨 CRITICAL CHANGE: Switched key from 'fpl_team_ID' to 'fpl_team_id'
+      final newFplTeamID = body['fpl_team_id'] as String?;
 
       if (newName == null && newFplTeamID == null) {
         return _jsonResponse(400, {'error': 'No fields provided for update.'});
@@ -443,15 +433,7 @@ class BackendAuthService {
       final updatedUserRow = result.first.toColumnMap();
       final user = BackendUser.fromPostgreSQL(updatedUserRow);
 
-      // 🔑 CRITICAL FIX: Regenerate JWT and include it in the response
-      final jwt = JWT({'id': user.id, 'email': user.email, 'verified': user.isEmailVerified});
-      final token = jwt.sign(SecretKey(_jwtSecret), expiresIn: Duration(days: 7));
-
-      final userWithToken = user.toJson()
-        ..['token'] = token
-        ..['message'] = 'Profile updated successfully';
-
-      return _jsonResponse(200, userWithToken);
+      return _jsonResponse(200, user.toJson()..['message'] = 'Profile updated successfully');
 
     } on PostgreSQLException catch (e) {
       print('PostgreSQL Error during Profile Update: $e');
