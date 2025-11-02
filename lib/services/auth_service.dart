@@ -392,15 +392,14 @@ class BackendAuthService {
       }
 
       // 2. Pre-process and validate inputs before entering the DB block
-      String? fplIdForDb;
-      if (newFplTeamIDInput != null) {
-        // Map empty string to NULL for nullable database column (clearing the field)
-        fplIdForDb = newFplTeamIDInput.isEmpty ? null : newFplTeamIDInput;
-      }
-
       if (newName != null && newName.isEmpty) {
         // Validation for the mandatory 'name' field
         throw Exception('Name cannot be empty.');
+      }
+
+      if (newFplTeamIDInput != null && newFplTeamIDInput.isEmpty) {
+        // Validation for the mandatory 'name' field
+        throw Exception('FPL TEAM ID cannot be empty.');
       }
 
 
@@ -415,10 +414,10 @@ class BackendAuthService {
         if (newFplTeamIDInput != null) {
 
           // Check for duplicate FPL ID (only if providing a non-null ID)
-          if (fplIdForDb != null) {
+          if (newFplTeamIDInput != null) {
             final existingFplId = await _dbConnection.query(
               "SELECT id FROM users WHERE fpl_team_id = @fplId AND id != @userId LIMIT 1",
-              substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
+              substitutionValues: {'fplId': newFplTeamIDInput, 'userId': userID},
             );
 
             if (existingFplId.isNotEmpty) {
