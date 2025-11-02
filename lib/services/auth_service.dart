@@ -385,7 +385,7 @@ class BackendAuthService {
 
       // 1. Get incoming values. Assuming Frontend sends 'fpl_team_ID' (mixed case).
       final newName = body['name'] as String?;
-      final newFplTeamIDInput = body['fpl_team_ID'] as String?;
+      final newFplTeamIDInput = body['fpl_team_id'] as String?;
 
       if (newName == null && newFplTeamIDInput == null) {
         return _jsonResponse(400, {'error': 'No fields provided for update.'});
