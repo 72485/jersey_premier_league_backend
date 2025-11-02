@@ -316,8 +316,8 @@ class BackendAuthService {
       final userID = payload['id'] as int;
       final body = json.decode(await request.readAsString());
 
-      // NOTE: Using 'fpl_team_ID' (mixed case) to match Dart model/Frontend
-      final newFplTeamIDInput = body['fpl_team_ID'] as String?;
+      // NOTE: Using 'fpl_team_id' (mixed case) to match Dart model/Frontend
+      final newFplTeamIDInput = body['fpl_team_id'] as String?;
 
       if (newFplTeamIDInput == null) {
         return _jsonResponse(400, {'error': 'FPL Team ID is required.'});
@@ -333,7 +333,7 @@ class BackendAuthService {
         if (fplIdForDb != null) {
           final existingFplId = await _dbConnection.query(
             // 🚨 CRITICAL FIX: Quote the column name to force mixed-case matching the schema
-            "SELECT id FROM users WHERE \"fpl_team_ID\" = @fplId AND id != @userId LIMIT 1",
+            "SELECT id FROM users WHERE \"fpl_team_id\" = @fplId AND id != @userId LIMIT 1",
             substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
           );
 
@@ -345,7 +345,7 @@ class BackendAuthService {
         // Perform the update query.
         return _dbConnection.query(
           // 🚨 CRITICAL FIX: Quote the column name in the UPDATE clause
-          "UPDATE users SET \"fpl_team_ID\" = @fplId WHERE id = @userId RETURNING id, name, email, \"fpl_team_ID\", is_email_verified",
+          "UPDATE users SET \"fpl_team_id\" = @fplId WHERE id = @userId RETURNING id, name, email, \"fpl_team_id\", is_email_verified",
           substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
         );
       });
@@ -385,7 +385,7 @@ class BackendAuthService {
 
       final newName = body['name'] as String?;
       // Key in JSON payload sent from frontend (must match Dart model)
-      final newFplTeamIDInput = body['fpl_team_ID'] as String?;
+      final newFplTeamIDInput = body['fpl_team_id'] as String?;
 
       if (newName == null && newFplTeamIDInput == null) {
         return _jsonResponse(400, {'error': 'No fields provided for update.'});
@@ -416,7 +416,7 @@ class BackendAuthService {
           if (fplIdForDb != null) {
             final existingFplId = await _dbConnection.query(
               // 🚨 CRITICAL FIX: Quote the column name to force mixed-case matching the schema
-              "SELECT id FROM users WHERE \"fpl_team_ID\" = @fplId AND id != @userId LIMIT 1",
+              "SELECT id FROM users WHERE \"fpl_team_id\" = @fplId AND id != @userId LIMIT 1",
               substitutionValues: {'fplId': fplIdForDb, 'userId': userID},
             );
 
@@ -427,7 +427,7 @@ class BackendAuthService {
 
           // Build the update clause for FPL ID
           // 🚨 CRITICAL FIX: Quote the column name to force mixed-case matching the schema
-          updateClauses.add('"fpl_team_ID" = @fplId');
+          updateClauses.add('"fpl_team_id" = @fplId');
           updates['fplId'] = fplIdForDb;
         }
 
@@ -444,7 +444,7 @@ class BackendAuthService {
         // Final execution of the UPDATE query
         return _dbConnection.query(
           // 🚨 CRITICAL FIX: Quote the column name in the RETURNING clause as well
-          "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, \"fpl_team_ID\", is_email_verified",
+          "UPDATE users SET ${updateClauses.join(', ')} WHERE id = @userId RETURNING id, name, email, \"fpl_team_id\", is_email_verified",
           substitutionValues: updates,
         );
       });

@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
 
     -- Application-specific field for the Fantasy Premier League Team ID
-    fpl_team_ID VARCHAR(50), -- Nullable
+    fpl_team_id VARCHAR(50), -- Nullable
 
     -- ⚡ FIX: NEW COLUMN for Email Verification
     is_email_verified BOOLEAN NOT NULL DEFAULT FALSE,
